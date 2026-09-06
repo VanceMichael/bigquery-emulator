@@ -65,6 +65,46 @@ CREATE TABLE IF NOT EXISTS routines (
   metadata  STRING,
   PRIMARY KEY (projectID, datasetID, id)
 )`,
+	// query_cache persists BigQuery-compatible cached query results. Each
+	// entry is keyed by the request context (project, default dataset, SQL,
+	// parameters) and carries the dependency snapshot that validates it.
+	`
+CREATE TABLE IF NOT EXISTS query_cache (
+  cacheKey     STRING NOT NULL,
+  projectID    STRING NOT NULL,
+  response     STRING,
+  dependencies STRING,
+  createdAt    INT64,
+  PRIMARY KEY (cacheKey)
+)`,
+	// table_versions and routine_versions hold a monotonic generation
+	// number per table/view and routine. Any content or schema change
+	// advances the version, which invalidates cached results depending on
+	// the object. Versions are drawn from the global cache_seq sequence so
+	// a dropped-and-recreated object never reuses a previous version.
+	`
+CREATE TABLE IF NOT EXISTS table_versions (
+  projectID STRING NOT NULL,
+  datasetID STRING NOT NULL,
+  tableID   STRING NOT NULL,
+  version   INT64,
+  PRIMARY KEY (projectID, datasetID, tableID)
+)`,
+	`
+CREATE TABLE IF NOT EXISTS routine_versions (
+  projectID STRING NOT NULL,
+  datasetID STRING NOT NULL,
+  routineID STRING NOT NULL,
+  version   INT64,
+  body      STRING,
+  PRIMARY KEY (projectID, datasetID, routineID)
+)`,
+	`
+CREATE TABLE IF NOT EXISTS cache_seq (
+  id INT64 NOT NULL,
+  v  INT64,
+  PRIMARY KEY (id)
+)`,
 }
 
 type Repository struct {

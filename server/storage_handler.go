@@ -552,6 +552,9 @@ func (s *storageWriteServer) appendRows(req *storagepb.AppendRowsRequest, msgDes
 			s.sendErrorMessage(stream, streamName, err)
 			return nil, "", err
 		}
+		// Rows appended through the Storage Write API change the table
+		// content: invalidate cached results that depend on it.
+		s.server.bumpTableVersion(ctx, tx, status.projectID, status.datasetID, status.tableID)
 		if err := tx.Commit(); err != nil {
 			s.sendErrorMessage(stream, streamName, err)
 			return nil, "", err
@@ -829,6 +832,9 @@ func (s *storageWriteServer) BatchCommitWriteStreams(ctx context.Context, req *s
 			streamErrors = append(streamErrors, s.createUnspecifiedStorageError(streamName, err))
 			continue
 		}
+		// Committing a buffered/streamed write changes the table content:
+		// invalidate cached results that depend on it.
+		s.server.bumpTableVersion(ctx, tx, status.projectID, status.datasetID, status.tableID)
 		if err := tx.Commit(); err != nil {
 			streamErrors = append(streamErrors, s.createUnspecifiedStorageError(streamName, err))
 		}
@@ -876,6 +882,9 @@ func (s *storageWriteServer) FlushRows(ctx context.Context, req *storagepb.Flush
 	if err := s.insertTableData(ctx, tx, status, rows); err != nil {
 		return nil, err
 	}
+	// Flushing buffered rows changes the table content: invalidate cached
+	// results that depend on it.
+	s.server.bumpTableVersion(ctx, tx, status.projectID, status.datasetID, status.tableID)
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}

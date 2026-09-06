@@ -27,6 +27,7 @@ type (
 		Rows           []*TableRow                `json:"rows"`
 		TotalRows      uint64                     `json:"totalRows,string"`
 		JobComplete    bool                       `json:"jobComplete"`
+		CacheHit       bool                       `json:"cacheHit,omitempty"`
 		TotalBytes     int64                      `json:"-"`
 		ChangedCatalog *googlesqlite.ChangedCatalog `json:"-"`
 	}

@@ -1,0 +1,3372 @@
+diff --git a/docs/feature-support.md b/docs/feature-support.md
+index 8729607..d627170 100644
+--- a/docs/feature-support.md
++++ b/docs/feature-support.md
+@@ -132,6 +132,19 @@ There is no `models.insert` in the BigQuery API — models are created with
+ | Extract | ✅ | See [section 5](#5-data-export). |
+ | Copy | ❌ | Table copy jobs are not implemented. |
+ 
++### 2.1 Query result cache
++
++Read-only, deterministic `SELECT` results are cached best-effort, matching
++BigQuery behavior:
++
++| Feature | Status | Notes |
++| --- | --- | --- |
++| `useQueryCache` (default enabled) | ✅ | `useQueryCache: false` always bypasses the cache. |
++| `cacheHit` statistics | ✅ | Reported on `jobs.query` and on job statistics (`jobs.get`), including for `jobs.insert` query jobs and `getQueryResults` consistency. |
++| Invalidation on table change | ✅ | DML/DDL, `tabledata.insertAll`, load jobs, the Storage Write API, and table/view create/update/delete invalidate cached results depending on those objects (transitively through views and SQL routines). Changes to unrelated tables do not invalidate entries. |
++| Non-cacheable queries | ✅ | Destination-table jobs, dry runs, multi-statement scripts, TEMP objects, wildcard tables, `INFORMATION_SCHEMA`, non-deterministic functions (`RAND()`, `CURRENT_TIMESTAMP()`, `NOW()`, `GENERATE_UUID()`, ...), and unresolvable/session-scoped references bypass the cache. |
++| Persistence | ✅ | The cache and per-object version stamps live in the metadata database; entries survive restart and are evicted after 24h. |
++
+ ---
+ 
+ ## 3. Storage and table types
+diff --git a/internal/metadata/querycache.go b/internal/metadata/querycache.go
+new file mode 100644
+index 0000000..10c7884
+--- /dev/null
++++ b/internal/metadata/querycache.go
+@@ -0,0 +1,316 @@
++package metadata
++
++import (
++	"context"
++	"database/sql"
++	"fmt"
++)
++
++// Dependency kinds recorded alongside a cached query result.
++const (
++	DependencyTable   = "table"
++	DependencyRoutine = "routine"
++)
++
++// Dependency is one table or routine whose content/schema a cached result
++// was computed from. The cached entry may only be served while every
++// dependency's current Version matches the snapshot taken at compute time.
++type Dependency struct {
++	Kind      string `json:"kind"`
++	ProjectID string `json:"projectId"`
++	DatasetID string `json:"datasetId"`
++	Name      string `json:"name"`
++	Version   int64  `json:"version"`
++}
++
++// QueryCacheEntry is one persisted query result: the serialized
++// internaltypes.QueryResponse plus the dependency snapshot it was validated
++// against.
++type QueryCacheEntry struct {
++	CacheKey     string
++	ProjectID    string
++	Response     string
++	Dependencies string
++	CreatedAt    int64
++}
++
++// FindQueryCacheEntry returns the cache entry for key, or nil when no entry
++// exists.
++func (r *Repository) FindQueryCacheEntry(ctx context.Context, tx *sql.Tx, key string) (*QueryCacheEntry, error) {
++	rows, err := tx.QueryContext(
++		ctx,
++		"SELECT cacheKey, projectID, response, dependencies, createdAt FROM query_cache WHERE cacheKey = @cacheKey",
++		sql.Named("cacheKey", key),
++	)
++	if err != nil {
++		return nil, fmt.Errorf("failed to get query cache entry: %w", err)
++	}
++	defer rows.Close()
++	if !rows.Next() {
++		return nil, nil
++	}
++	var entry QueryCacheEntry
++	if err := rows.Scan(&entry.CacheKey, &entry.ProjectID, &entry.Response, &entry.Dependencies, &entry.CreatedAt); err != nil {
++		return nil, err
++	}
++	return &entry, nil
++}
++
++// PutQueryCacheEntry stores (or replaces) a cache entry keyed by CacheKey.
++func (r *Repository) PutQueryCacheEntry(ctx context.Context, tx *sql.Tx, entry *QueryCacheEntry) error {
++	if _, err := tx.ExecContext(
++		ctx,
++		"DELETE FROM query_cache WHERE cacheKey = @cacheKey",
++		sql.Named("cacheKey", entry.CacheKey),
++	); err != nil {
++		return fmt.Errorf("failed to delete old query cache entry: %w", err)
++	}
++	if _, err := tx.ExecContext(
++		ctx,
++		"INSERT query_cache (cacheKey, projectID, response, dependencies, createdAt) VALUES (@cacheKey, @projectID, @response, @dependencies, @createdAt)",
++		sql.Named("cacheKey", entry.CacheKey),
++		sql.Named("projectID", entry.ProjectID),
++		sql.Named("response", entry.Response),
++		sql.Named("dependencies", entry.Dependencies),
++		sql.Named("createdAt", entry.CreatedAt),
++	); err != nil {
++		return fmt.Errorf("failed to insert query cache entry: %w", err)
++	}
++	return nil
++}
++
++// DeleteQueryCacheEntry removes a single cache entry. Used to evict entries
++// found stale on lookup; failures are best-effort.
++func (r *Repository) DeleteQueryCacheEntry(ctx context.Context, tx *sql.Tx, key string) error {
++	if _, err := tx.ExecContext(
++		ctx,
++		"DELETE FROM query_cache WHERE cacheKey = @cacheKey",
++		sql.Named("cacheKey", key),
++	); err != nil {
++		return fmt.Errorf("failed to delete query cache entry: %w", err)
++	}
++	return nil
++}
++
++// ClearQueryCache removes every cache entry. It is the safety valve invoked
++// when a version bump fails: callers can no longer prove which entries are
++// still valid, so subsequent requests recompute their results.
++func (r *Repository) ClearQueryCache(ctx context.Context, tx *sql.Tx) error {
++	if _, err := tx.ExecContext(ctx, "DELETE FROM query_cache"); err != nil {
++		return fmt.Errorf("failed to clear query cache: %w", err)
++	}
++	return nil
++}
++
++// nextCacheSeq returns a process-wide monotonic version. Versions are
++// global (rather than per-object) so that dropping and recreating a table
++// under the same name can never collide with an earlier generation's
++// version.
++func (r *Repository) nextCacheSeq(ctx context.Context, tx *sql.Tx) (int64, error) {
++	rows, err := tx.QueryContext(ctx, "SELECT v FROM cache_seq WHERE id = 1")
++	if err != nil {
++		return 0, fmt.Errorf("failed to get cache sequence: %w", err)
++	}
++	var current int64
++	exists := false
++	if rows.Next() {
++		if err := rows.Scan(&current); err != nil {
++			rows.Close()
++			return 0, err
++		}
++		exists = true
++	}
++	if err := rows.Err(); err != nil {
++		rows.Close()
++		return 0, err
++	}
++	rows.Close()
++	if !exists {
++		if _, err := tx.ExecContext(ctx, "INSERT cache_seq (id, v) VALUES (1, 1)"); err != nil {
++			return 0, fmt.Errorf("failed to initialize cache sequence: %w", err)
++		}
++		return 1, nil
++	}
++	next := current + 1
++	if _, err := tx.ExecContext(
++		ctx,
++		"UPDATE cache_seq SET v = @v WHERE id = 1",
++		sql.Named("v", next),
++	); err != nil {
++		return 0, fmt.Errorf("failed to update cache sequence: %w", err)
++	}
++	return next, nil
++}
++
++// BumpTableVersion advances the recorded version of a table or view to a
++// fresh globally-unique value after any content or schema change.
++func (r *Repository) BumpTableVersion(ctx context.Context, tx *sql.Tx, projectID, datasetID, tableID string) error {
++	return r.bumpVersion(ctx, tx, "table_versions", "tableID", projectID, datasetID, tableID, "")
++}
++
++// EnsureTableVersion returns the current version of a table, creating the
++// version row (snapshotting the current state) when it does not exist yet.
++// Used to snapshot the dependencies of a result being cached, so that the
++// first later mutation invalidates the entry.
++func (r *Repository) EnsureTableVersion(ctx context.Context, tx *sql.Tx, projectID, datasetID, tableID string) (int64, error) {
++	version, found, err := r.findVersion(ctx, tx, "table_versions", "tableID", projectID, datasetID, tableID)
++	if err != nil {
++		return 0, err
++	}
++	if found {
++		return version, nil
++	}
++	seq, err := r.nextCacheSeq(ctx, tx)
++	if err != nil {
++		return 0, err
++	}
++	if err := r.insertVersion(ctx, tx, "table_versions", "tableID", projectID, datasetID, tableID, seq, ""); err != nil {
++		return 0, err
++	}
++	return seq, nil
++}
++
++// FindTableVersion returns the current version of a table and whether a
++// version row exists.
++func (r *Repository) FindTableVersion(ctx context.Context, tx *sql.Tx, projectID, datasetID, tableID string) (int64, bool, error) {
++	return r.findVersion(ctx, tx, "table_versions", "tableID", projectID, datasetID, tableID)
++}
++
++// BumpRoutineVersion advances the recorded version of a routine (function,
++// table function or procedure). A non-empty body replaces the stored SQL
++// definition so dependency resolution can expand routines that reference
++// tables.
++func (r *Repository) BumpRoutineVersion(ctx context.Context, tx *sql.Tx, projectID, datasetID, routineID, body string) error {
++	if err := r.bumpVersion(ctx, tx, "routine_versions", "routineID", projectID, datasetID, routineID, body); err != nil {
++		return err
++	}
++	if body != "" {
++		if _, err := tx.ExecContext(
++			ctx,
++			"UPDATE routine_versions SET body = @body WHERE projectID = @projectID AND datasetID = @datasetID AND routineID = @routineID",
++			sql.Named("body", body),
++			sql.Named("projectID", projectID),
++			sql.Named("datasetID", datasetID),
++			sql.Named("routineID", routineID),
++		); err != nil {
++			return fmt.Errorf("failed to update routine body: %w", err)
++		}
++	}
++	return nil
++}
++
++// FindRoutineVersion returns the current version and stored SQL body of a
++// routine and whether a version row exists.
++func (r *Repository) FindRoutineVersion(ctx context.Context, tx *sql.Tx, projectID, datasetID, routineID string) (int64, string, bool, error) {
++	rows, err := tx.QueryContext(
++		ctx,
++		"SELECT version, body FROM routine_versions WHERE projectID = @projectID AND datasetID = @datasetID AND routineID = @routineID",
++		sql.Named("projectID", projectID),
++		sql.Named("datasetID", datasetID),
++		sql.Named("routineID", routineID),
++	)
++	if err != nil {
++		return 0, "", false, fmt.Errorf("failed to get routine version: %w", err)
++	}
++	defer rows.Close()
++	if !rows.Next() {
++		return 0, "", false, nil
++	}
++	var version int64
++	var body string
++	if err := rows.Scan(&version, &body); err != nil {
++		return 0, "", false, err
++	}
++	return version, body, true, nil
++}
++
++func (r *Repository) bumpVersion(ctx context.Context, tx *sql.Tx, table, idColumn, projectID, datasetID, objectID, body string) error {
++	_, found, err := r.findVersion(ctx, tx, table, idColumn, projectID, datasetID, objectID)
++	if err != nil {
++		return err
++	}
++	seq, err := r.nextCacheSeq(ctx, tx)
++	if err != nil {
++		return err
++	}
++	if found {
++		if _, err := tx.ExecContext(
++			ctx,
++			fmt.Sprintf("UPDATE %s SET version = @version WHERE projectID = @projectID AND datasetID = @datasetID AND %s = @objectID", table, idColumn),
++			sql.Named("version", seq),
++			sql.Named("projectID", projectID),
++			sql.Named("datasetID", datasetID),
++			sql.Named("objectID", objectID),
++		); err != nil {
++			return fmt.Errorf("failed to update %s version: %w", table, err)
++		}
++		// The body column exists only on routine_versions.
++		if body != "" && table == "routine_versions" {
++			if _, err := tx.ExecContext(
++				ctx,
++				"UPDATE routine_versions SET body = @body WHERE projectID = @projectID AND datasetID = @datasetID AND routineID = @routineID",
++				sql.Named("body", body),
++				sql.Named("projectID", projectID),
++				sql.Named("datasetID", datasetID),
++				sql.Named("routineID", objectID),
++			); err != nil {
++				return fmt.Errorf("failed to update routine body: %w", err)
++			}
++		}
++		return nil
++	}
++	if err := r.insertVersion(ctx, tx, table, idColumn, projectID, datasetID, objectID, seq, body); err != nil {
++		return err
++	}
++	return nil
++}
++
++func (r *Repository) findVersion(ctx context.Context, tx *sql.Tx, table, idColumn, projectID, datasetID, objectID string) (int64, bool, error) {
++	rows, err := tx.QueryContext(
++		ctx,
++		fmt.Sprintf("SELECT version FROM %s WHERE projectID = @projectID AND datasetID = @datasetID AND %s = @objectID", table, idColumn),
++		sql.Named("projectID", projectID),
++		sql.Named("datasetID", datasetID),
++		sql.Named("objectID", objectID),
++	)
++	if err != nil {
++		return 0, false, fmt.Errorf("failed to get version from %s: %w", table, err)
++	}
++	defer rows.Close()
++	if !rows.Next() {
++		return 0, false, nil
++	}
++	var version int64
++	if err := rows.Scan(&version); err != nil {
++		return 0, false, err
++	}
++	return version, true, nil
++}
++
++func (r *Repository) insertVersion(ctx context.Context, tx *sql.Tx, table, idColumn, projectID, datasetID, objectID string, version int64, body string) error {
++	if table == "routine_versions" {
++		if _, err := tx.ExecContext(
++			ctx,
++			"INSERT routine_versions (projectID, datasetID, routineID, version, body) VALUES (@projectID, @datasetID, @routineID, @version, @body)",
++			sql.Named("projectID", projectID),
++			sql.Named("datasetID", datasetID),
++			sql.Named("routineID", objectID),
++			sql.Named("version", version),
++			sql.Named("body", body),
++		); err != nil {
++			return fmt.Errorf("failed to insert routine version: %w", err)
++		}
++		return nil
++	}
++	if _, err := tx.ExecContext(
++		ctx,
++		fmt.Sprintf("INSERT %s (projectID, datasetID, %s, version) VALUES (@projectID, @datasetID, @objectID, @version)", table, idColumn),
++		sql.Named("projectID", projectID),
++		sql.Named("datasetID", datasetID),
++		sql.Named("objectID", objectID),
++		sql.Named("version", version),
++	); err != nil {
++		return fmt.Errorf("failed to insert %s version: %w", table, err)
++	}
++	return nil
++}
+diff --git a/internal/metadata/repository.go b/internal/metadata/repository.go
+index 6ffaa18..127b543 100644
+--- a/internal/metadata/repository.go
++++ b/internal/metadata/repository.go
+@@ -64,6 +64,46 @@ CREATE TABLE IF NOT EXISTS routines (
+   datasetID STRING NOT NULL,
+   metadata  STRING,
+   PRIMARY KEY (projectID, datasetID, id)
++)`,
++	// query_cache persists BigQuery-compatible cached query results. Each
++	// entry is keyed by the request context (project, default dataset, SQL,
++	// parameters) and carries the dependency snapshot that validates it.
++	`
++CREATE TABLE IF NOT EXISTS query_cache (
++  cacheKey     STRING NOT NULL,
++  projectID    STRING NOT NULL,
++  response     STRING,
++  dependencies STRING,
++  createdAt    INT64,
++  PRIMARY KEY (cacheKey)
++)`,
++	// table_versions and routine_versions hold a monotonic generation
++	// number per table/view and routine. Any content or schema change
++	// advances the version, which invalidates cached results depending on
++	// the object. Versions are drawn from the global cache_seq sequence so
++	// a dropped-and-recreated object never reuses a previous version.
++	`
++CREATE TABLE IF NOT EXISTS table_versions (
++  projectID STRING NOT NULL,
++  datasetID STRING NOT NULL,
++  tableID   STRING NOT NULL,
++  version   INT64,
++  PRIMARY KEY (projectID, datasetID, tableID)
++)`,
++	`
++CREATE TABLE IF NOT EXISTS routine_versions (
++  projectID STRING NOT NULL,
++  datasetID STRING NOT NULL,
++  routineID STRING NOT NULL,
++  version   INT64,
++  body      STRING,
++  PRIMARY KEY (projectID, datasetID, routineID)
++)`,
++	`
++CREATE TABLE IF NOT EXISTS cache_seq (
++  id INT64 NOT NULL,
++  v  INT64,
++  PRIMARY KEY (id)
+ )`,
+ }
+ 
+diff --git a/internal/querycache/analyze.go b/internal/querycache/analyze.go
+new file mode 100644
+index 0000000..78865f0
+--- /dev/null
++++ b/internal/querycache/analyze.go
+@@ -0,0 +1,911 @@
++// Package querycache provides the SQL text analysis used by the
++// BigQuery-compatible query result cache: it decides whether a statement is
++// eligible for caching, extracts the tables and routines a statement reads
++// (so a stored result can be invalidated when any of them changes) and the
++// tables/routines a statement writes (so those entries can be invalidated
++// after DML/DDL), and builds the stable cache key from the request context.
++//
++// The analysis is deliberately conservative: every construct it cannot prove
++// to be a read-only, deterministic reference to a persistent object either
++// marks the statement as non-cacheable or is reported as an unresolved
++// reference, which the caller treats as "do not cache". It never produces a
++// false "cacheable" for a statement that performs writes or depends on
++// session-scoped or non-deterministic state.
++package querycache
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"sort"
++	"strings"
++
++	bigqueryv2 "google.golang.org/api/bigquery/v2"
++)
++
++// RefKind identifies what an extracted reference points at.
++type RefKind int
++
++const (
++	// RefTable is a table or view appearing in a FROM/JOIN position.
++	RefTable RefKind = iota
++	// RefCall is a path immediately followed by '(' (a routine call,
++	// including table-valued functions used in FROM position).
++	RefCall
++)
++
++// Ref is one table- or routine-like reference extracted from the SQL text.
++type Ref struct {
++	// Parts are the (up to three) qualified name segments, as written in
++	// the statement (a single backtick-quoted "p.d.t" is split into its
++	// three segments). Case is preserved for catalog resolution.
++	Parts []string
++	// Kind is RefTable (FROM/JOIN factor) or RefCall (path followed by '(').
++	Kind RefKind
++	// Wildcard is set when the reference contains a '*' (e.g. `ds.*`),
++	// which makes the statement non-cacheable.
++	Wildcard bool
++}
++
++// TargetKind distinguishes table targets from routine targets.
++type TargetKind int
++
++const (
++	TargetTable TargetKind = iota
++	TargetRoutine
++)
++
++// Target is a table or routine that a statement modifies (DDL/DML target).
++type Target struct {
++	Parts []string
++	Kind  TargetKind
++}
++
++// DatasetTarget names a dataset that a statement drops.
++type DatasetTarget struct {
++	ProjectID string
++	DatasetID string
++}
++
++// Analysis holds the result of analyzing one (possibly multi-statement)
++// SQL text.
++type Analysis struct {
++	// Cacheable reports whether the text is a single read-only SELECT that
++	// contains no construct the cache cannot reason about. It does NOT take
++	// request options into account (useQueryCache, destination tables, ...):
++	// the caller combines those with this flag.
++	Cacheable bool
++	// NotCacheableReason explains why Cacheable is false (for logging).
++	NotCacheableReason string
++	// ReadRefs are the tables/views in FROM/JOIN positions and every
++	// routine-call-like path. Resolution against the catalog is left to the
++	// caller.
++	ReadRefs []Ref
++	// WriteTargets are the tables/routines modified by DDL/DML statements.
++	WriteTargets []Target
++	// DropDatasets are datasets that statements drop (all tables and
++	// routines in them must be treated as changed).
++	DropDatasets []DatasetTarget
++	// CTENames are the single-part names introduced by `name AS (` CTE
++	// definitions (lowercased). An unqualified read ref matching one of
++	// these is not a table reference.
++	CTENames map[string]struct{}
++}
++
++// token kinds
++const (
++	tkWord   = iota // bare word (keyword/identifier), Text keeps original case
++	tkQuoted        // backtick-quoted identifier, Text is the inner content
++	tkPunct         // single-character punctuation
++)
++
++type token struct {
++	kind int
++	text string
++}
++
++func (t token) lower() string { return strings.ToLower(t.text) }
++
++// isWord reports whether t is a word token equal (case-insensitively) to s.
++func (t token) isWord(s string) bool { return t.kind == tkWord && strings.EqualFold(t.text, s) }
++
++// tokenize splits GoogleSQL text into tokens, masking out string literals,
++// numeric literals and comments so keyword/reference scanning never sees
++// their contents. Backtick-quoted identifiers are preserved.
++func tokenize(sql string) []token {
++	tokens := []token{}
++	r := []rune(sql)
++	i := 0
++	n := len(r)
++	for i < n {
++		c := r[i]
++		switch {
++		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v':
++			i++
++		case c == '-' && i+1 < n && r[i+1] == '-':
++			// line comment
++			i += 2
++			for i < n && r[i] != '\n' {
++				i++
++			}
++		case c == '/' && i+1 < n && r[i+1] == '*':
++			// block comment (BigQuery allows nested block comments)
++			depth := 1
++			i += 2
++			for i < n && depth > 0 {
++				if i+1 < n && r[i] == '/' && r[i+1] == '*' {
++					depth++
++					i += 2
++					continue
++				}
++				if i+1 < n && r[i] == '*' && r[i+1] == '/' {
++					depth--
++					i += 2
++					continue
++				}
++				i++
++			}
++		case c == '\'':
++			i = skipString(r, i, '\'')
++		case c == '"':
++			// GoogleSQL treats double quotes as string delimiters.
++			i = skipString(r, i, '"')
++		case c == '`':
++			var sb strings.Builder
++			i++
++			closed := false
++			for i < n {
++				ch := r[i]
++				if ch == '\\' && i+1 < n {
++					sb.WriteRune(r[i+1])
++					i += 2
++					continue
++				}
++				if ch == '`' {
++					if i+1 < n && r[i+1] == '`' {
++						// doubled backtick is a literal backtick
++						sb.WriteRune('`')
++						i += 2
++						continue
++					}
++					i++
++					closed = true
++					break
++				}
++				sb.WriteRune(ch)
++				i++
++			}
++			if !closed {
++				// unterminated quote: return what we have; the statement
++				// will fail to execute anyway
++			}
++			tokens = append(tokens, token{kind: tkQuoted, text: sb.String()})
++		case isIdentStart(c):
++			start := i
++			i++
++			for i < n && isIdentPart(r[i]) {
++				i++
++			}
++			tokens = append(tokens, token{kind: tkWord, text: string(r[start:i])})
++		case c >= '0' && c <= '9':
++			// numeric literal: mask it entirely; it never participates in
++			// references or keywords
++			i++
++			for i < n {
++				ch := r[i]
++				if (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F') ||
++					ch == '.' || ch == 'x' || ch == 'X' || ch == 'e' || ch == 'E' || ch == '+' || ch == '-' {
++					i++
++					continue
++				}
++				break
++			}
++		default:
++			tokens = append(tokens, token{kind: tkPunct, text: string(c)})
++			i++
++		}
++	}
++	return tokens
++}
++
++// skipString consumes a single/double quoted string starting at the quote
++// rune and returns the index just past the closing quote. Both backslash
++// escapes and doubled quotes ('') are honored.
++func skipString(r []rune, start int, quote rune) int {
++	i := start + 1
++	for i < len(r) {
++		c := r[i]
++		if c == '\\' && i+1 < len(r) {
++			i += 2
++			continue
++		}
++		if c == quote {
++			if i+1 < len(r) && r[i+1] == quote {
++				i += 2
++				continue
++			}
++			return i + 1
++		}
++		i++
++	}
++	return i
++}
++
++func isIdentStart(c rune) bool {
++	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
++}
++
++func isIdentPart(c rune) bool {
++	return isIdentStart(c) || (c >= '0' && c <= '9')
++}
++
++// parsePath parses a qualified name (segments of words/quoted idents joined
++// by '.') starting at tokens[start]. It returns the up-to-three segments
++// (quoted segments may themselves contain dots, which are split out), the
++// index past the path, whether the path is immediately followed by '(', and
++// whether a '*' wildcard was encountered in or right after the path.
++func parsePath(tokens []token, start int) (parts []string, next int, isCall bool, wildcard bool, ok bool) {
++	i := start
++	for {
++		if i >= len(tokens) {
++			return nil, start, false, false, false
++		}
++		t := tokens[i]
++		if t.kind == tkPunct && t.text == "*" {
++			// leading or standalone '*'
++			return parts, i + 1, false, true, len(parts) > 0
++		}
++		if t.kind != tkWord && t.kind != tkQuoted {
++			break
++		}
++		segments := []string{t.text}
++		if t.kind == tkQuoted {
++			if strings.Contains(t.text, "*") {
++				wildcard = true
++			}
++			segments = strings.Split(t.text, ".")
++		}
++		parts = append(parts, segments...)
++		i++
++		// optional continuation: '.segment' or '.*'
++		if i < len(tokens) && tokens[i].kind == tkPunct && tokens[i].text == "." {
++			i++
++			if i < len(tokens) && tokens[i].kind == tkPunct && tokens[i].text == "*" {
++				return parts, i + 1, false, true, true
++			}
++			continue
++		}
++		break
++	}
++	if len(parts) == 0 {
++		return nil, start, false, false, false
++	}
++	if i < len(tokens) && tokens[i].kind == tkPunct && tokens[i].text == "(" {
++		isCall = true
++	}
++	return parts, i, isCall, wildcard, true
++}
++
++// keywords that terminate a FROM-clause factor list when seen at the
++// factor's parenthesis depth
++var fromClauseEndKeywords = map[string]struct{}{
++	"where": {}, "group": {}, "having": {}, "order": {}, "limit": {},
++	"offset": {}, "union": {}, "except": {}, "intersect": {}, "window": {},
++	"qualify": {}, "values": {},
++}
++
++// non-deterministic BigQuery functions that prevent result caching. The
++// CURRENT_* / SESSION_USER / CURRENT_USER forms may be written without
++// parentheses; the others require a call.
++var nondeterministicBareWords = map[string]struct{}{
++	"current_date":      {},
++	"current_time":      {},
++	"current_timestamp": {},
++	"current_datetime":  {},
++	"session_user":      {},
++	"current_user":      {},
++}
++
++var nondeterministicCallWords = map[string]struct{}{
++	"now":            {},
++	"rand":           {},
++	"generate_uuid":  {},
++	"user":           {},
++}
++
++// Analyze parses the given GoogleSQL text and returns its cache analysis.
++func Analyze(sql string) *Analysis {
++	tokens := tokenize(sql)
++	a := &Analysis{Cacheable: true, CTENames: map[string]struct{}{}}
++
++	collectCTENames(tokens, a)
++	collectReadRefs(tokens, a)
++	collectCalls(tokens, a)
++	a.ReadRefs = dedupeRefs(a.ReadRefs)
++
++	// Statement-level classification and write-target extraction.
++	statements := splitStatements(tokens)
++	if len(statements) == 0 {
++		a.Cacheable = false
++		a.NotCacheableReason = "empty statement"
++		return a
++	}
++	if len(statements) > 1 {
++		a.Cacheable = false
++		a.NotCacheableReason = "multi-statement script"
++	}
++	for _, stmt := range statements {
++		extractWriteTargets(stmt, a)
++	}
++	if a.Cacheable && !isReadOnlyStatement(statements[0]) {
++		a.Cacheable = false
++		a.NotCacheableReason = "statement is not a read-only SELECT"
++	}
++
++	// Text-level disqualifiers that apply regardless of statement shape.
++	for idx, t := range tokens {
++		if t.kind != tkWord {
++			continue
++		}
++		w := t.lower()
++		if w == "temp" || w == "temporary" {
++			a.Cacheable = false
++			a.NotCacheableReason = "references TEMP/TEMPORARY objects"
++		}
++		if w == "information_schema" {
++			a.Cacheable = false
++			a.NotCacheableReason = "references INFORMATION_SCHEMA"
++		}
++		if _, exists := nondeterministicBareWords[w]; exists {
++			a.Cacheable = false
++			a.NotCacheableReason = "uses non-deterministic function " + w
++		}
++		if _, exists := nondeterministicCallWords[w]; exists {
++			if idx+1 < len(tokens) && tokens[idx+1].kind == tkPunct && tokens[idx+1].text == "(" {
++				a.Cacheable = false
++				a.NotCacheableReason = "uses non-deterministic function " + w
++			}
++		}
++	}
++	// @@system_variable references depend on session state.
++	for idx := 0; idx+1 < len(tokens); idx++ {
++		t1, t2 := tokens[idx], tokens[idx+1]
++		if t1.kind == tkPunct && t1.text == "@" && t2.kind == tkPunct && t2.text == "@" {
++			a.Cacheable = false
++			a.NotCacheableReason = "references session system variables (@@)"
++		}
++	}
++	for _, ref := range a.ReadRefs {
++		if ref.Wildcard {
++			a.Cacheable = false
++			a.NotCacheableReason = "references wildcard tables"
++		}
++	}
++	return a
++}
++
++// collectCTENames records every single-part name immediately followed by
++// `AS (` — the shape of a CTE definition. Over-collection is harmless: a
++// name that is not actually a CTE only causes an unqualified table
++// reference to be (conservatively) treated as a CTE by the caller, which
++// never returns stale data for real tables.
++func collectCTENames(tokens []token, a *Analysis) {
++	for i := 0; i+2 < len(tokens); i++ {
++		t := tokens[i]
++		if t.kind != tkWord && t.kind != tkQuoted {
++			continue
++		}
++		if !tokens[i+1].isWord("as") {
++			continue
++		}
++		if tokens[i+2].kind != tkPunct || tokens[i+2].text != "(" {
++			continue
++		}
++		name := t.text
++		if t.kind == tkQuoted && strings.Contains(name, ".") {
++			// CTE names are always single-part; ignore qualified forms.
++			continue
++		}
++		a.CTENames[strings.ToLower(name)] = struct{}{}
++	}
++}
++
++// collectReadRefs walks FROM/JOIN clauses at every parenthesis depth and
++// records the table factors (and TVF calls) they name.
++func collectReadRefs(tokens []token, a *Analysis) {
++	depth := 0
++	factorDepth := -1
++	expectFactor := false
++	inFromList := false
++	for i := 0; i < len(tokens); i++ {
++		t := tokens[i]
++		if t.kind == tkPunct {
++			switch t.text {
++			case "(":
++				if expectFactor {
++					// subquery factor: its interior is scanned when the
++					// walk reaches the inner FROM keyword. The subquery
++					// itself is a table factor, so a comma at the same
++					// depth afterwards introduces another factor.
++					expectFactor = false
++					inFromList = true
++					depth++
++					continue
++				}
++				depth++
++				continue
++			case ")":
++				depth--
++				if depth < factorDepth {
++					factorDepth = -1
++					inFromList = false
++					expectFactor = false
++				}
++				continue
++			case ",":
++				if inFromList && depth == factorDepth {
++					expectFactor = true
++				}
++				continue
++			}
++		}
++		if t.kind == tkWord {
++			w := t.lower()
++			if w == "from" || w == "join" {
++				expectFactor = true
++				factorDepth = depth
++				inFromList = false
++				continue
++			}
++			if expectFactor && w == "unnest" {
++				// UNNEST(array) is an expression, not a table reference
++				expectFactor = false
++				continue
++			}
++			if inFromList && depth == factorDepth {
++				if _, end := fromClauseEndKeywords[w]; end {
++					inFromList = false
++					expectFactor = false
++					continue
++				}
++			}
++		}
++		if expectFactor {
++			parts, _, isCall, wildcard, ok := parsePath(tokens, i)
++			if !ok {
++				// not a name factor (e.g. a keyword-construct); drop out of
++				// factor state and keep scanning
++				expectFactor = false
++				continue
++			}
++			a.ReadRefs = append(a.ReadRefs, Ref{
++				Parts:    parts,
++				Kind:     refKindForCall(isCall),
++				Wildcard: wildcard,
++			})
++			expectFactor = false
++			inFromList = true
++		}
++	}
++}
++
++func refKindForCall(isCall bool) RefKind {
++	if isCall {
++		return RefCall
++	}
++	return RefTable
++}
++
++// callKeywordSkips are keywords that can directly precede a parenthesised
++// expression (e.g. `FROM (subquery)`, `name AS (cte body)`, `IN (...)`). They
++// are never routine calls.
++var callKeywordSkips = map[string]struct{}{
++	"as": {}, "from": {}, "in": {}, "then": {}, "else": {},
++	"when": {}, "return": {}, "using": {}, "on": {},
++}
++
++// collectCalls records every qualified path immediately followed by '(' as
++// a possible routine call. Calls that do not resolve to a catalog routine
++// (built-ins, keywords, casts) are ignored by the caller; unresolved calls
++// never make a statement non-cacheable on their own.
++func collectCalls(tokens []token, a *Analysis) {
++	for i := 0; i < len(tokens); i++ {
++		t := tokens[i]
++		if t.kind != tkWord && t.kind != tkQuoted {
++			continue
++		}
++		// A path segment directly preceded by '.' is the tail of a
++		// qualified call (whose head is handled when the loop reaches it).
++		if i > 0 {
++			if prev := tokens[i-1]; prev.kind == tkPunct && prev.text == "." {
++				continue
++			}
++		}
++		if t.kind == tkWord {
++			if _, skip := callKeywordSkips[t.lower()]; skip {
++				continue
++			}
++		}
++		parts, _, isCall, wildcard, ok := parsePath(tokens, i)
++		if !ok || !isCall || wildcard {
++			continue
++		}
++		a.ReadRefs = append(a.ReadRefs, Ref{Parts: parts, Kind: RefCall})
++	}
++}
++
++// dedupeRefs drops references identical in kind and parts, preserving order.
++func dedupeRefs(refs []Ref) []Ref {
++	seen := map[string]bool{}
++	out := make([]Ref, 0, len(refs))
++	for _, ref := range refs {
++		key := refKey(ref)
++		if seen[key] {
++			continue
++		}
++		seen[key] = true
++		out = append(out, ref)
++	}
++	return out
++}
++
++func refKey(ref Ref) string {
++	return fmt.Sprintf("%d|%s", ref.Kind, strings.Join(ref.Parts, "."))
++}
++
++// splitStatements breaks tokens into statements at depth-0 semicolons.
++func splitStatements(tokens []token) [][]token {
++	var (
++		out        [][]token
++		cur        []token
++		depth      int
++	)
++	for _, t := range tokens {
++		if t.kind == tkPunct {
++			switch t.text {
++			case "(":
++				depth++
++			case ")":
++				depth--
++			case ";":
++				if depth == 0 {
++					if len(cur) > 0 {
++						out = append(out, cur)
++						cur = nil
++					}
++					continue
++				}
++			}
++		}
++		cur = append(cur, t)
++	}
++	if len(cur) > 0 {
++		out = append(out, cur)
++	}
++	return out
++}
++
++// rootKeyword returns the first keyword of a statement, skipping over a
++// leading WITH clause and its CTE definitions (`WITH x AS (...), y AS (...)`).
++func rootKeyword(stmt []token) (string, int) {
++	if len(stmt) == 0 || stmt[0].kind != tkWord {
++		return "", 0
++	}
++	i := 0
++	if !stmt[i].isWord("with") {
++		return stmt[i].lower(), i
++	}
++	// WITH [RECURSIVE] <name> AS ( <...> ) [, <name> AS ( <...> ) ] ...
++	i++
++	if i < len(stmt) && stmt[i].isWord("recursive") {
++		i++
++	}
++	for i < len(stmt) {
++		// expect a CTE name
++		if stmt[i].kind != tkWord && stmt[i].kind != tkQuoted {
++			break
++		}
++		i++
++		// expect AS
++		if i >= len(stmt) || !stmt[i].isWord("as") {
++			break
++		}
++		i++
++		// expect '(' and skip to its matching ')'
++		if i >= len(stmt) || stmt[i].kind != tkPunct || stmt[i].text != "(" {
++			break
++		}
++		depth := 0
++		for i < len(stmt) {
++			if stmt[i].kind == tkPunct && stmt[i].text == "(" {
++				depth++
++			}
++			if stmt[i].kind == tkPunct && stmt[i].text == ")" {
++				depth--
++				i++
++				if depth == 0 {
++					break
++				}
++				continue
++			}
++			i++
++		}
++		// either a comma (another CTE) or the statement keyword follows
++		if i < len(stmt) && stmt[i].kind == tkPunct && stmt[i].text == "," {
++			i++
++			continue
++		}
++		break
++	}
++	if i >= len(stmt) || stmt[i].kind != tkWord {
++		return "", i
++	}
++	return stmt[i].lower(), i
++}
++
++// isReadOnlyStatement reports whether the statement's root keyword is
++// SELECT (possibly prefixed by WITH CTEs). Every other statement type is
++// treated as a potential side effect and bypasses the cache.
++func isReadOnlyStatement(stmt []token) bool {
++	root, _ := rootKeyword(stmt)
++	return root == "select"
++}
++
++// extractWriteTargets appends the DDL/DML targets of one statement to a.
++func extractWriteTargets(stmt []token, a *Analysis) {
++	root, i := rootKeyword(stmt)
++	switch root {
++	case "insert":
++		i++
++		if i < len(stmt) && (stmt[i].isWord("into") || stmt[i].isWord("overwrite")) {
++			i++
++		}
++		addTableTarget(stmt, i, a)
++	case "update":
++		i++
++		addTableTarget(stmt, i, a)
++	case "delete":
++		i++
++		if i < len(stmt) && stmt[i].isWord("from") {
++			i++
++		}
++		addTableTarget(stmt, i, a)
++	case "merge":
++		i++
++		if i < len(stmt) && stmt[i].isWord("into") {
++			i++
++		}
++		addTableTarget(stmt, i, a)
++	case "truncate":
++		i++
++		if i < len(stmt) && stmt[i].isWord("table") {
++			i++
++		}
++		addTableTarget(stmt, i, a)
++	case "optimize":
++		i++
++		if i < len(stmt) && stmt[i].isWord("table") {
++			i++
++		}
++		addTableTarget(stmt, i, a)
++	case "alter":
++		i++
++		// ALTER [MATERIALIZED] {TABLE|VIEW} ...
++		if i < len(stmt) && stmt[i].isWord("materialized") {
++			i++
++		}
++		if i < len(stmt) && (stmt[i].isWord("table") || stmt[i].isWord("view") || stmt[i].isWord("snapshot")) {
++			i++
++		}
++		i = skipIfExists(stmt, i)
++		addTableTarget(stmt, i, a)
++	case "drop":
++		i++
++		extractDropTarget(stmt, i, a)
++	case "create":
++		i++
++		if i < len(stmt) && stmt[i].isWord("or") {
++			i += 2 // OR REPLACE
++		}
++		if i < len(stmt) && (stmt[i].isWord("temp") || stmt[i].isWord("temporary")) {
++			// session-scoped object; nothing shared to invalidate
++			return
++		}
++		extractCreateTarget(stmt, i, a)
++	case "call":
++		i++
++		// CALL path( ... ): the procedure is a routine target; its body
++		// (if known to the caller) may reference tables.
++		parts, _, _, _, ok := parsePath(stmt, i)
++		if ok {
++			a.WriteTargets = append(a.WriteTargets, Target{Parts: parts, Kind: TargetRoutine})
++		}
++	}
++}
++
++func extractDropTarget(stmt []token, i int, a *Analysis) {
++	if i >= len(stmt) || stmt[i].kind != tkWord {
++		return
++	}
++	w := stmt[i].lower()
++	switch w {
++	case "materialized":
++		i++
++		// MATERIALIZED VIEW
++		if i < len(stmt) && stmt[i].isWord("view") {
++			i++
++		}
++		i = skipIfExists(stmt, i)
++		addTableTarget(stmt, i, a)
++	case "table":
++		i++
++		if i < len(stmt) && stmt[i].isWord("function") {
++			// DROP TABLE FUNCTION <name>
++			i++
++			i = skipIfExists(stmt, i)
++			addRoutineTarget(stmt, i, a)
++			return
++		}
++		i = skipIfExists(stmt, i)
++		addTableTarget(stmt, i, a)
++	case "view", "snapshot":
++		i++
++		i = skipIfExists(stmt, i)
++		addTableTarget(stmt, i, a)
++	case "external":
++		i++
++		if i < len(stmt) && stmt[i].isWord("table") {
++			i++
++		}
++		i = skipIfExists(stmt, i)
++		addTableTarget(stmt, i, a)
++	case "function", "procedure":
++		i++
++		i = skipIfExists(stmt, i)
++		addRoutineTarget(stmt, i, a)
++	case "schema", "dataset":
++		i++
++		i = skipIfExists(stmt, i)
++		if i < len(stmt) {
++			parts, _, _, _, ok := parsePath(stmt, i)
++			if ok {
++				a.DropDatasets = append(a.DropDatasets, datasetTargetFromParts(parts))
++			}
++		}
++	}
++}
++
++func extractCreateTarget(stmt []token, i int, a *Analysis) {
++	if i >= len(stmt) || stmt[i].kind != tkWord {
++		return
++	}
++	w := stmt[i].lower()
++	switch w {
++	case "external":
++		i++
++		if i < len(stmt) && stmt[i].isWord("table") {
++			i++
++		}
++		i = skipIfNotExists(stmt, i)
++		addTableTarget(stmt, i, a)
++	case "snapshot":
++		i++
++		if i < len(stmt) && stmt[i].isWord("table") {
++			i++
++		}
++		i = skipIfNotExists(stmt, i)
++		addTableTarget(stmt, i, a)
++	case "materialized":
++		i++
++		if i < len(stmt) && stmt[i].isWord("view") {
++			i++
++		}
++		i = skipIfNotExists(stmt, i)
++		addTableTarget(stmt, i, a)
++	case "table":
++		i++
++		if i < len(stmt) && stmt[i].isWord("function") {
++			// CREATE TABLE FUNCTION <name>
++			i++
++			i = skipIfNotExists(stmt, i)
++			addRoutineTarget(stmt, i, a)
++			return
++		}
++		i = skipIfNotExists(stmt, i)
++		addTableTarget(stmt, i, a)
++	case "view":
++		i++
++		i = skipIfNotExists(stmt, i)
++		addTableTarget(stmt, i, a)
++	case "table_function":
++		i++
++		i = skipIfNotExists(stmt, i)
++		addRoutineTarget(stmt, i, a)
++	case "function", "procedure":
++		i++
++		i = skipIfNotExists(stmt, i)
++		addRoutineTarget(stmt, i, a)
++	case "schema", "dataset":
++		// nothing to invalidate for a newly created empty dataset
++	}
++}
++
++func skipIfExists(stmt []token, i int) int {
++	if i+1 < len(stmt) && stmt[i].isWord("if") && stmt[i+1].isWord("exists") {
++		return i + 2
++	}
++	return i
++}
++
++func skipIfNotExists(stmt []token, i int) int {
++	if i+2 < len(stmt) && stmt[i].isWord("if") && stmt[i+1].isWord("not") && stmt[i+2].isWord("exists") {
++		return i + 3
++	}
++	return i
++}
++
++func addTableTarget(stmt []token, i int, a *Analysis) {
++	parts, _, _, _, ok := parsePath(stmt, i)
++	if !ok {
++		return
++	}
++	a.WriteTargets = append(a.WriteTargets, Target{Parts: parts, Kind: TargetTable})
++}
++
++func addRoutineTarget(stmt []token, i int, a *Analysis) {
++	parts, _, _, _, ok := parsePath(stmt, i)
++	if !ok {
++		return
++	}
++	a.WriteTargets = append(a.WriteTargets, Target{Parts: parts, Kind: TargetRoutine})
++}
++
++func datasetTargetFromParts(parts []string) DatasetTarget {
++	switch len(parts) {
++	case 3:
++		return DatasetTarget{ProjectID: parts[0], DatasetID: parts[1]}
++	case 2:
++		return DatasetTarget{ProjectID: parts[0], DatasetID: parts[1]}
++	default:
++		// single-part dataset targets are qualified with the request
++		// project by the caller
++		return DatasetTarget{DatasetID: parts[0]}
++	}
++}
++
++// KeyInput is the request context that determines a query result: two
++// requests with identical KeyInput produce identical results, and any
++// difference that can change the result produces a different key.
++type KeyInput struct {
++	ProjectID            string                           `json:"projectId"`
++	DefaultProjectID     string                           `json:"defaultProjectId,omitempty"`
++	DefaultDatasetID     string                           `json:"defaultDatasetId,omitempty"`
++	Query                string                           `json:"query"`
++	ParameterMode        string                           `json:"parameterMode,omitempty"`
++	ConnectionProperties []*bigqueryv2.ConnectionProperty `json:"connectionProperties,omitempty"`
++	UseLegacySQL         bool                             `json:"useLegacySql,omitempty"`
++	Params               []*bigqueryv2.QueryParameter     `json:"params"`
++}
++
++// BuildKey returns the stable cache key for the given request context.
++// Parameters and connection properties are serialized deterministically
++// (encoding/json sorts map keys) so equivalent requests hash identically.
++func BuildKey(in *KeyInput) (string, error) {
++	params := make([]*bigqueryv2.QueryParameter, len(in.Params))
++	copy(params, in.Params)
++	props := make([]*bigqueryv2.ConnectionProperty, len(in.ConnectionProperties))
++	copy(props, in.ConnectionProperties)
++	sort.SliceStable(props, func(i, j int) bool {
++		return props[i].Key < props[j].Key
++	})
++	clone := *in
++	clone.Params = params
++	clone.ConnectionProperties = props
++	encoded, err := json.Marshal(&clone)
++	if err != nil {
++		return "", err
++	}
++	sum := sha256.Sum256(encoded)
++	return hex.EncodeToString(sum[:]), nil
++}
+diff --git a/internal/querycache/analyze_test.go b/internal/querycache/analyze_test.go
+new file mode 100644
+index 0000000..245f283
+--- /dev/null
++++ b/internal/querycache/analyze_test.go
+@@ -0,0 +1,330 @@
++package querycache
++
++import (
++	"strings"
++	"testing"
++
++	bigqueryv2 "google.golang.org/api/bigquery/v2"
++)
++
++func TestAnalyzeCacheable(t *testing.T) {
++	tests := []struct {
++		name      string
++		sql       string
++		cacheable bool
++		refs      []string // expected read ref parts (dotted), in order
++		writeT    int      // number of write targets
++	}{
++		{
++			name:      "plain select",
++			sql:       "SELECT 1",
++			cacheable: true,
++		},
++		{
++			name:      "select from table",
++			sql:       "SELECT * FROM d.t WHERE id > 2",
++			cacheable: true,
++			refs:      []string{"d.t"},
++		},
++		{
++			name:      "fully qualified and joins",
++			sql:       "SELECT a.x FROM p.d.t1 a JOIN p.d.t2 b ON a.id = b.id LEFT JOIN d.t3 c ON c.id = a.id",
++			cacheable: true,
++			refs:      []string{"p.d.t1", "p.d.t2", "d.t3"},
++		},
++		{
++			name:      "comma join",
++			sql:       "SELECT * FROM t1, d.t2 WHERE t1.id = t2.id",
++			cacheable: true,
++			refs:      []string{"t1", "d.t2"},
++		},
++		{
++			name:      "cte reference is reported (server skips CTE names)",
++			sql:       "WITH c AS (SELECT 1 AS x) SELECT * FROM c",
++			cacheable: true,
++			refs:      []string{"c"},
++		},
++		{
++			name:      "subquery from clause",
++			sql:       "SELECT x FROM (SELECT id AS x FROM d.t) sub",
++			cacheable: true,
++			refs:      []string{"d.t"},
++		},
++		{
++			name:      "backtick full path",
++			sql:       "SELECT * FROM `p.d.t`",
++			cacheable: true,
++			refs:      []string{"p.d.t"},
++		},
++		{
++			name:      "tvf call",
++			sql:       "SELECT * FROM d.my_tvf(1)",
++			cacheable: true,
++			refs:      []string{"d.my_tvf"},
++		},
++		{
++			name:      "insert not cacheable",
++			sql:       "INSERT INTO d.t (id) VALUES (1)",
++			cacheable: false,
++			writeT:    1,
++		},
++		{
++			name:      "update not cacheable",
++			sql:       "UPDATE d.t SET id = 2 WHERE id = 1",
++			cacheable: false,
++			writeT:    1,
++		},
++		{
++			name:      "delete not cacheable",
++			sql:       "DELETE FROM d.t WHERE id = 1",
++			cacheable: false,
++			writeT:    1,
++		},
++		{
++			name:      "merge not cacheable",
++			sql:       "MERGE d.t USING d.s ON t.id = s.id WHEN MATCHED THEN DELETE",
++			cacheable: false,
++			writeT:    1,
++		},
++		{
++			name:      "truncate not cacheable",
++			sql:       "TRUNCATE TABLE d.t",
++			cacheable: false,
++			writeT:    1,
++		},
++		{
++			name:      "alter table not cacheable",
++			sql:       "ALTER TABLE d.t ADD COLUMN c INT64",
++			cacheable: false,
++			writeT:    1,
++		},
++		{
++			name:      "create table target",
++			sql:       "CREATE TABLE d.new AS SELECT 1 AS x",
++			cacheable: false,
++			writeT:    1,
++		},
++		{
++			name:      "create or replace view target",
++			sql:       "CREATE OR REPLACE VIEW d.v AS SELECT * FROM d.t",
++			cacheable: false,
++			writeT:    1,
++		},
++		{
++			name:      "drop table target",
++			sql:       "DROP TABLE IF EXISTS d.t",
++			cacheable: false,
++			writeT:    1,
++		},
++		{
++			name:      "create function target",
++			sql:       "CREATE FUNCTION d.f(x INT64) AS (x + 1)",
++			cacheable: false,
++			writeT:    1,
++		},
++		{
++			name:      "create table function target",
++			sql:       "CREATE TABLE FUNCTION d.tvf() AS (SELECT * FROM d.t)",
++			cacheable: false,
++			writeT:    1,
++		},
++		{
++			name:      "drop function target",
++			sql:       "DROP FUNCTION IF EXISTS d.f",
++			cacheable: false,
++			writeT:    1,
++		},
++		{
++			name:      "drop dataset",
++			sql:       "DROP SCHEMA IF EXISTS d",
++			cacheable: false,
++			writeT:    0,
++		},
++		{
++			name:      "multi statement",
++			sql:       "SELECT 1; SELECT 2",
++			cacheable: false,
++		},
++		{
++			name:      "current timestamp",
++			sql:       "SELECT CURRENT_TIMESTAMP()",
++			cacheable: false,
++		},
++		{
++			name:      "current date bare",
++			sql:       "SELECT CURRENT_DATE",
++			cacheable: false,
++		},
++		{
++			name:      "rand",
++			sql:       "SELECT RAND()",
++			cacheable: false,
++		},
++		{
++			name:      "generate_uuid",
++			sql:       "SELECT GENERATE_UUID()",
++			cacheable: false,
++		},
++		{
++			name:      "temp table",
++			sql:       "CREATE TEMP TABLE x AS SELECT 1 AS a",
++			cacheable: false,
++		},
++		{
++			name:      "information schema",
++			sql:       "SELECT * FROM d.INFORMATION_SCHEMA.TABLES",
++			cacheable: false,
++		},
++		{
++			name:      "wildcard table",
++			sql:       "SELECT * FROM `d.*`",
++			cacheable: false,
++		},
++		{
++			name:      "unnest is not a dependency",
++			sql:       "SELECT * FROM UNNEST([1,2,3]) AS n",
++			cacheable: true,
++			refs:      nil,
++		},
++		{
++			name:      "string content ignored",
++			sql:       "SELECT 'INSERT INTO d.t VALUES (1)' AS s FROM d.other",
++			cacheable: true,
++			refs:      []string{"d.other"},
++		},
++		{
++			name:      "comment ignored",
++			sql:       "SELECT 1 /* FROM d.t */ -- INSERT INTO x\n",
++			cacheable: true,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			a := Analyze(tc.sql)
++			if a.Cacheable != tc.cacheable {
++				t.Fatalf("Cacheable = %v (reason: %q), want %v", a.Cacheable, a.NotCacheableReason, tc.cacheable)
++			}
++			var gotRefs []string
++			for _, ref := range a.ReadRefs {
++				name := strings.Join(ref.Parts, ".")
++				// UNNEST(...) is a collected call but never a dependency
++				if strings.EqualFold(ref.Parts[0], "unnest") {
++					continue
++				}
++				gotRefs = append(gotRefs, name)
++			}
++			if !tc.cacheable {
++				// Ref contents are not asserted for statements that
++				// bypass the cache.
++				return
++			}
++			if tc.refs == nil {
++				if len(gotRefs) != 0 {
++					t.Fatalf("table refs = %v, want none", gotRefs)
++				}
++			} else if strings.Join(gotRefs, ",") != strings.Join(tc.refs, ",") {
++				t.Fatalf("table refs = %v, want %v", gotRefs, tc.refs)
++			}
++			if tc.writeT != 0 && len(a.WriteTargets) != tc.writeT {
++				t.Fatalf("write targets = %d, want %d", len(a.WriteTargets), tc.writeT)
++			}
++		})
++	}
++}
++
++func TestAnalyzeWriteTargetKinds(t *testing.T) {
++	a := Analyze("MERGE d.t USING d.s ON 1=1 WHEN MATCHED THEN DELETE; " +
++		"UPDATE d.u SET x = 1; " +
++		"CREATE FUNCTION d.g() AS ((SELECT COUNT(*) FROM d.w));")
++	var tables, routines []string
++	for _, tgt := range a.WriteTargets {
++		name := strings.Join(tgt.Parts, ".")
++		if tgt.Kind == TargetTable {
++			tables = append(tables, name)
++		} else {
++			routines = append(routines, name)
++		}
++	}
++	// Only the target of each DML statement is a write target; the
++	// MERGE source `d.s` and the table read by the function body are not.
++	wantTables := map[string]bool{"d.t": false, "d.u": false}
++	for _, name := range tables {
++		if _, ok := wantTables[name]; ok {
++			wantTables[name] = true
++		}
++	}
++	for name, found := range wantTables {
++		if !found {
++			t.Fatalf("missing write target %q; got tables %v", name, tables)
++		}
++	}
++	if len(routines) != 1 || routines[0] != "d.g" {
++		t.Fatalf("routine targets = %v, want [d.g]", routines)
++	}
++}
++
++func TestBuildKeyDistinguishesContext(t *testing.T) {
++	base := &KeyInput{
++		ProjectID: "p",
++		Query:     "SELECT * FROM d.t WHERE id = ?",
++	}
++	key1, err := BuildKey(base)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// Same content in a different request order: deterministic.
++	key1b, _ := BuildKey(base)
++	if key1 != key1b {
++		t.Fatal("key is not deterministic")
++	}
++
++	different := func(mut func(*KeyInput)) string {
++		c := *base
++		c.Params = append([]*bigqueryv2.QueryParameter(nil), base.Params...)
++		c.ConnectionProperties = append([]*bigqueryv2.ConnectionProperty(nil), base.ConnectionProperties...)
++		mut(&c)
++		k, err := BuildKey(&c)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return k
++	}
++
++	// A parameter value changes the result: different key.
++	param := func(v string) *bigqueryv2.QueryParameter {
++		return &bigqueryv2.QueryParameter{
++			ParameterType:  &bigqueryv2.QueryParameterType{Type: "INT64"},
++			ParameterValue: &bigqueryv2.QueryParameterValue{Value: v},
++		}
++	}
++	kWithParam := different(func(k *KeyInput) { k.Params = []*bigqueryv2.QueryParameter{param("1")} })
++	if kWithParam == key1 {
++		t.Fatal("key ignores query parameters")
++	}
++	kWithParam2 := different(func(k *KeyInput) { k.Params = []*bigqueryv2.QueryParameter{param("2")} })
++	if kWithParam == kWithParam2 {
++		t.Fatal("key ignores parameter values")
++	}
++
++	// Default dataset changes resolution: different key.
++	kOtherDataset := different(func(k *KeyInput) { k.DefaultDatasetID = "other" })
++	if kOtherDataset == key1 {
++		t.Fatal("key ignores default dataset")
++	}
++
++	// SQL text: different key.
++	kOtherSQL := different(func(k *KeyInput) { k.Query = "SELECT 2" })
++	if kOtherSQL == key1 {
++		t.Fatal("key ignores SQL text")
++	}
++
++	// Connection properties (map order stable): different key.
++	kWithProp := different(func(k *KeyInput) {
++		k.ConnectionProperties = []*bigqueryv2.ConnectionProperty{{Key: "time_zone", Value: "UTC"}}
++	})
++	if kWithProp == key1 {
++		t.Fatal("key ignores connection properties")
++	}
++}
+diff --git a/internal/types/types.go b/internal/types/types.go
+index 8b7f5d8..c84dcf8 100644
+--- a/internal/types/types.go
++++ b/internal/types/types.go
+@@ -27,6 +27,7 @@ type (
+ 		Rows           []*TableRow                `json:"rows"`
+ 		TotalRows      uint64                     `json:"totalRows,string"`
+ 		JobComplete    bool                       `json:"jobComplete"`
++		CacheHit       bool                       `json:"cacheHit,omitempty"`
+ 		TotalBytes     int64                      `json:"-"`
+ 		ChangedCatalog *googlesqlite.ChangedCatalog `json:"-"`
+ 	}
+diff --git a/server/handler.go b/server/handler.go
+index 32a2c7d..d44792f 100644
+--- a/server/handler.go
++++ b/server/handler.go
+@@ -31,6 +31,7 @@ import (
+ 	"github.com/goccy/bigquery-emulator/internal/contentdata"
+ 	"github.com/goccy/bigquery-emulator/internal/logger"
+ 	"github.com/goccy/bigquery-emulator/internal/metadata"
++	"github.com/goccy/bigquery-emulator/internal/querycache"
+ 	internaltypes "github.com/goccy/bigquery-emulator/internal/types"
+ 	"github.com/goccy/bigquery-emulator/types"
+ 	"github.com/parquet-go/parquet-go"
+@@ -689,6 +690,13 @@ func (h *uploadContentHandler) Handle(ctx context.Context, r *uploadContentReque
+ 	if err := r.server.contentRepo.AddTableData(ctx, tx, tableRef.ProjectId, tableRef.DatasetId, tableDef); err != nil {
+ 		return err
+ 	}
++	// A load job replaces or appends the destination table content:
++	// invalidate cached results that depend on it.
++	projectID := tableRef.ProjectId
++	if projectID == "" {
++		projectID = r.project.ID
++	}
++	r.server.bumpTableVersion(ctx, tx, projectID, tableRef.DatasetId, tableRef.TableId)
+ 	if err := tx.Commit(); err != nil {
+ 		return err
+ 	}
+@@ -857,6 +865,9 @@ func (h *datasetsDeleteHandler) Handle(ctx context.Context, r *datasetsDeleteReq
+ 				ID:     table.ID,
+ 				IsView: table.IsView(),
+ 			})
++			// Every cached result that depended on a dropped table must be
++			// invalidated.
++			r.server.bumpTableVersion(ctx, tx, r.project.ID, r.dataset.ID, table.ID)
+ 		}
+ 		if err := r.server.contentRepo.DeleteTables(ctx, tx, r.project.ID, r.dataset.ID, deletions); err != nil {
+ 			return fmt.Errorf("failed to delete tables: %w", err)
+@@ -1740,6 +1751,32 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
+ 		return nil, fmt.Errorf("unspecified job configuration query")
+ 	}
+ 	queryProjectID, datasetID := queryProjectAndDataset(job.Configuration.Query.DefaultDataset, r.project.ID)
++	analysis := querycache.Analyze(job.Configuration.Query.Query)
++	hasDestinationTable := job.Configuration.Query.DestinationTable != nil
++	canCache := !job.Configuration.DryRun &&
++		!hasDestinationTable &&
++		!job.Configuration.Query.CreateSession &&
++		queryCacheEnabled(job.Configuration.Query.UseQueryCache) &&
++		analysis.Cacheable
++	var cacheKey string
++	if canCache {
++		key, keyErr := r.server.buildQueryCacheKey(
++			r.project.ID,
++			queryProjectID,
++			datasetID,
++			job.Configuration.Query.DefaultDataset,
++			job.Configuration.Query.Query,
++			job.Configuration.Query.QueryParameters,
++			job.Configuration.Query.ParameterMode,
++			job.Configuration.Query.ConnectionProperties,
++			job.Configuration.Query.UseLegacySql != nil && *job.Configuration.Query.UseLegacySql,
++		)
++		if keyErr != nil {
++			canCache = false
++		} else {
++			cacheKey = key
++		}
++	}
+ 	conn, err := r.server.connMgr.Connection(ctx, queryProjectID, datasetID)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to get connection: %w", err)
+@@ -1749,17 +1786,42 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
+ 		return nil, fmt.Errorf("failed to start transaction: %w", err)
+ 	}
+ 	defer tx.RollbackIfNotCommitted()
+-	hasDestinationTable := job.Configuration.Query.DestinationTable != nil
+ 	startTime := time.Now()
+-	response, jobErr := r.server.contentRepo.Query(
+-		ctx,
+-		tx,
+-		queryProjectID,
+-		datasetID,
+-		job.Configuration.Query.Query,
+-		job.Configuration.Query.QueryParameters,
++	var (
++		response *internaltypes.QueryResponse
++		jobErr   error
++		cacheHit bool
+ 	)
++	// A validated cache entry skips execution entirely: the job still gets
++	// its anonymous results table (clients read results through the
++	// destination reference) and reports cacheHit=true with zero bytes
++	// processed, exactly like real BigQuery.
++	if canCache {
++		if cached, hit := r.server.cacheLookup(ctx, tx, cacheKey); hit {
++			response = cached
++			cacheHit = true
++		}
++	}
++	if !cacheHit {
++		response, jobErr = r.server.contentRepo.Query(
++			ctx,
++			tx,
++			queryProjectID,
++			datasetID,
++			job.Configuration.Query.Query,
++			job.Configuration.Query.QueryParameters,
++		)
++	}
+ 	endTime := time.Now()
++	if job.JobReference == nil {
++		// A job reference is optional on insert; allocate one so the
++		// server-generated job id has somewhere to live (most clients
++		// supply their own reference, but a bare request must not panic).
++		job.JobReference = &bigqueryv2.JobReference{ProjectId: r.project.ID}
++	}
++	if job.JobReference.ProjectId == "" {
++		job.JobReference.ProjectId = r.project.ID
++	}
+ 	if job.JobReference.JobId == "" {
+ 		job.JobReference.JobId = randomID() // generate job id
+ 	}
+@@ -1804,6 +1866,9 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
+ 			if err := r.server.contentRepo.AddTableData(ctx, tx, destinationProject.ID, tableRef.DatasetId, tableDef); err != nil {
+ 				return nil, fmt.Errorf("failed to add table data: %w", err)
+ 			}
++			// Writing to a destination table changes its content/schema:
++			// invalidate every cached result that depends on it.
++			r.server.bumpTableVersion(ctx, tx, destinationProject.ID, tableRef.DatasetId, tableRef.TableId)
+ 		} else if response != nil && response.Schema != nil && len(response.Schema.Fields) > 0 {
+ 			// A query that produces a result set (a SELECT, as opposed to a
+ 			// DDL/DML statement that has no result schema) still gets an
+@@ -1834,12 +1899,12 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
+ 	}
+ 	job.Status = status
+ 	var totalBytes int64
+-	if response != nil {
++	if response != nil && !cacheHit {
+ 		totalBytes = response.TotalBytes
+ 	}
+ 	job.Statistics = &bigqueryv2.JobStatistics{
+ 		Query: &bigqueryv2.JobStatistics2{
+-			CacheHit:            false,
++			CacheHit:            cacheHit,
+ 			StatementType:       "SELECT",
+ 			TotalBytesBilled:    totalBytes,
+ 			TotalBytesProcessed: totalBytes,
+@@ -1849,6 +1914,21 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
+ 		EndTime:             endTime.Unix(),
+ 		TotalBytesProcessed: totalBytes,
+ 	}
++	if !job.Configuration.DryRun && !cacheHit {
++		// Bump versions for every object this statement changed
++		// (DML/DDL targets, routines). On a cache hit nothing ran.
++		if jobErr == nil {
++			r.server.invalidateForQuery(ctx, tx, queryProjectID, datasetID, job.Configuration.Query.Query, response.ChangedCatalog)
++			// Populate the cache for a freshly computed, read-only,
++			// deterministic result whose references all resolve.
++			if canCache && response != nil && response.Schema != nil && len(response.Schema.Fields) > 0 &&
++				(response.ChangedCatalog == nil || !response.ChangedCatalog.Changed()) {
++				if deps, ok := r.server.resolveDependencies(ctx, tx, queryProjectID, datasetID, analysis); ok {
++					r.server.cacheStore(ctx, tx, cacheKey, r.project.ID, response, deps)
++				}
++			}
++		}
++	}
+ 	if err := r.project.AddJob(
+ 		ctx,
+ 		tx.Tx(),
+@@ -1867,7 +1947,7 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
+ 		if err := tx.Commit(); err != nil {
+ 			return nil, fmt.Errorf("failed to commit job: %w", err)
+ 		}
+-		if response != nil && response.ChangedCatalog.Changed() {
++		if !cacheHit && response != nil && response.ChangedCatalog != nil && response.ChangedCatalog.Changed() {
+ 			if err := syncCatalog(ctx, r.server, response.ChangedCatalog); err != nil {
+ 				return nil, err
+ 			}
+@@ -2122,6 +2202,30 @@ type jobsQueryRequest struct {
+ 
+ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*internaltypes.QueryResponse, error) {
+ 	queryProjectID, datasetID := queryProjectAndDataset(r.queryRequest.DefaultDataset, r.project.ID)
++	analysis := querycache.Analyze(r.queryRequest.Query)
++	canCache := !r.queryRequest.DryRun &&
++		!r.queryRequest.CreateSession &&
++		queryCacheEnabled(r.queryRequest.UseQueryCache) &&
++		analysis.Cacheable
++	var cacheKey string
++	if canCache {
++		key, err := r.server.buildQueryCacheKey(
++			r.project.ID,
++			queryProjectID,
++			datasetID,
++			r.queryRequest.DefaultDataset,
++			r.queryRequest.Query,
++			r.queryRequest.QueryParameters,
++			r.queryRequest.ParameterMode,
++			r.queryRequest.ConnectionProperties,
++			r.queryRequest.UseLegacySql != nil && *r.queryRequest.UseLegacySql,
++		)
++		if err != nil {
++			canCache = false
++		} else {
++			cacheKey = key
++		}
++	}
+ 	conn, err := r.server.connMgr.Connection(ctx, queryProjectID, datasetID)
+ 	if err != nil {
+ 		return nil, err
+@@ -2132,16 +2236,32 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
+ 	}
+ 	defer tx.RollbackIfNotCommitted()
+ 	startTime := time.Now()
+-	response, queryErr := r.server.contentRepo.Query(
+-		ctx,
+-		tx,
+-		queryProjectID,
+-		datasetID,
+-		r.queryRequest.Query,
+-		r.queryRequest.QueryParameters,
++	var (
++		response *internaltypes.QueryResponse
++		queryErr error
++		cacheHit bool
+ 	)
+-	if queryErr != nil {
+-		return nil, queryErr
++	// A validated cache entry skips execution entirely: the result is
++	// reused as-is and a fresh job records the hit, exactly like real
++	// BigQuery (cache hits bill and process zero bytes).
++	if canCache {
++		if cached, hit := r.server.cacheLookup(ctx, tx, cacheKey); hit {
++			response = cached
++			cacheHit = true
++		}
++	}
++	if !cacheHit {
++		response, queryErr = r.server.contentRepo.Query(
++			ctx,
++			tx,
++			queryProjectID,
++			datasetID,
++			r.queryRequest.Query,
++			r.queryRequest.QueryParameters,
++		)
++		if queryErr != nil {
++			return nil, queryErr
++		}
+ 	}
+ 	endTime := time.Now()
+ 	// jobs.query allocates jobIDs server-side (real BigQuery does the
+@@ -2167,7 +2287,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
+ 	// returns to the caller; DryRun queries skip both the AddJob and the
+ 	// Commit so they remain side-effect-free.
+ 	var totalBytes int64
+-	if response != nil {
++	if response != nil && !cacheHit {
+ 		totalBytes = response.TotalBytes
+ 	}
+ 	job := &bigqueryv2.Job{
+@@ -2190,7 +2310,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
+ 		Status: &bigqueryv2.JobStatus{State: "DONE"},
+ 		Statistics: &bigqueryv2.JobStatistics{
+ 			Query: &bigqueryv2.JobStatistics2{
+-				CacheHit:            false,
++				CacheHit:            cacheHit,
+ 				StatementType:       "SELECT",
+ 				TotalBytesBilled:    totalBytes,
+ 				TotalBytesProcessed: totalBytes,
+@@ -2208,6 +2328,20 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
+ 		),
+ 	}
+ 	if !r.queryRequest.DryRun {
++		if !cacheHit {
++			// Bump versions for everything this statement changed
++			// (DML/DDL targets, routines). On a cache hit nothing runs,
++			// so nothing can have changed.
++			r.server.invalidateForQuery(ctx, tx, queryProjectID, datasetID, r.queryRequest.Query, response.ChangedCatalog)
++			// Populate the cache for a freshly computed, read-only,
++			// deterministic result whose references all resolve.
++			if canCache && response != nil && response.Schema != nil && len(response.Schema.Fields) > 0 &&
++				(response.ChangedCatalog == nil || !response.ChangedCatalog.Changed()) {
++				if deps, ok := r.server.resolveDependencies(ctx, tx, queryProjectID, datasetID, analysis); ok {
++					r.server.cacheStore(ctx, tx, cacheKey, r.project.ID, response, deps)
++				}
++			}
++		}
+ 		if err := r.project.AddJob(
+ 			ctx,
+ 			tx.Tx(),
+@@ -2225,7 +2359,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
+ 		if err := tx.Commit(); err != nil {
+ 			return nil, err
+ 		}
+-		if response.ChangedCatalog.Changed() {
++		if !cacheHit && response.ChangedCatalog != nil && response.ChangedCatalog.Changed() {
+ 			if err := syncCatalog(ctx, r.server, response.ChangedCatalog); err != nil {
+ 				return nil, err
+ 			}
+@@ -2233,6 +2367,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
+ 	}
+ 	response.Rows = internaltypes.Format(response.Schema, response.Rows, r.useInt64Timestamp)
+ 	response.JobReference = job.JobReference
++	response.CacheHit = cacheHit
+ 	return response, nil
+ }
+ 
+@@ -2553,6 +2688,22 @@ func (h *routinesInsertHandler) Handle(ctx context.Context, r *routinesInsertReq
+ 	if err := r.server.contentRepo.AddRoutineByMetaData(ctx, tx, r.routine); err != nil {
+ 		return nil, err
+ 	}
++	// A routine definition changes the results of queries that call it.
++	// Record its version (and SQL body, so routine references can be
++	// expanded for table dependencies).
++	projectID, datasetID, routineID := r.project.ID, r.dataset.ID, ""
++	if ref := r.routine.RoutineReference; ref != nil {
++		if ref.ProjectId != "" {
++			projectID = ref.ProjectId
++		}
++		if ref.DatasetId != "" {
++			datasetID = ref.DatasetId
++		}
++		routineID = ref.RoutineId
++	}
++	if routineID != "" {
++		r.server.bumpRoutineVersion(ctx, tx, projectID, datasetID, routineID, r.routine.DefinitionBody)
++	}
+ 	if err := tx.Commit(); err != nil {
+ 		return nil, err
+ 	}
+@@ -2849,6 +3000,9 @@ func (h *tabledataInsertAllHandler) Handle(ctx context.Context, r *tabledataInse
+ 		if err := r.server.contentRepo.AddTableData(ctx, tx, r.project.ID, r.dataset.ID, tableDef); err != nil {
+ 			return nil, err
+ 		}
++		// Inserted rows change the table content: invalidate cached results
++		// that depend on it.
++		r.server.bumpTableVersion(ctx, tx, r.table.ProjectID, r.table.DatasetID, r.table.ID)
+ 		if err := tx.Commit(); err != nil {
+ 			return nil, err
+ 		}
+@@ -2959,6 +3113,11 @@ func (h *tablesDeleteHandler) Handle(ctx context.Context, r *tablesDeleteRequest
+ 	); err != nil {
+ 		return fmt.Errorf("failed to delete table %s: %w", r.table.ID, err)
+ 	}
++	// Dropping the table (or view) invalidates every cached result that
++	// depended on it. The version advances to a fresh global value so a
++	// later table recreated under the same name can never satisfy an old
++	// snapshot.
++	r.server.bumpTableVersion(ctx, tx, r.project.ID, r.dataset.ID, r.table.ID)
+ 	if err := tx.Commit(); err != nil {
+ 		return err
+ 	}
+@@ -3180,6 +3339,10 @@ func (h *tablesInsertHandler) Handle(ctx context.Context, r *tablesInsertRequest
+ 			return nil, errInternalError(err.Error())
+ 		}
+ 	}
++	// A new table or view is a catalog change: invalidate cached results
++	// that depend on the name (and, for CREATE OR REPLACE-like paths, the
++	// new generation).
++	r.server.bumpTableVersion(ctx, tx, r.project.ID, r.dataset.ID, r.table.TableReference.TableId)
+ 	if err := tx.Commit(); err != nil {
+ 		return nil, errInternalError(fmt.Errorf("failed to commit table: %w", err).Error())
+ 	}
+@@ -3384,6 +3547,9 @@ func (h *tablesPatchHandler) Handle(ctx context.Context, r *tablesPatchRequest)
+ 	if err := r.table.Patch(ctx, tx.Tx(), tableMetadata); err != nil {
+ 		return nil, err
+ 	}
++	// Metadata edits may change the view definition or other
++	// result-affecting attributes, so invalidate cached results on it.
++	r.server.bumpTableVersion(ctx, tx, r.project.ID, r.dataset.ID, r.table.ID)
+ 	if err := tx.Commit(); err != nil {
+ 		return nil, err
+ 	}
+@@ -3489,6 +3655,9 @@ func (h *tablesUpdateHandler) Handle(ctx context.Context, r *tablesUpdateRequest
+ 	if err := r.table.Replace(ctx, tx.Tx(), tableMetadata); err != nil {
+ 		return nil, err
+ 	}
++	// The resource was fully replaced (possibly including a view query),
++	// so invalidate cached results that depend on this table.
++	r.server.bumpTableVersion(ctx, tx, r.project.ID, r.dataset.ID, r.table.ID)
+ 	if err := tx.Commit(); err != nil {
+ 		return nil, err
+ 	}
+diff --git a/server/loader.go b/server/loader.go
+index 8216ab9..566fe0b 100644
+--- a/server/loader.go
++++ b/server/loader.go
+@@ -110,5 +110,8 @@ func (s *Server) addTableData(ctx context.Context, tx *connection.Tx, project *t
+ 	if err := s.contentRepo.AddTableData(ctx, tx, project.ID, dataset.ID, table); err != nil {
+ 		return err
+ 	}
++	// Seeding (or re-seeding on restart) replaces the table content: any
++	// cached result depending on it must be invalidated.
++	s.bumpTableVersion(ctx, tx, project.ID, dataset.ID, table.ID)
+ 	return nil
+ }
+diff --git a/server/query_cache.go b/server/query_cache.go
+new file mode 100644
+index 0000000..4464e59
+--- /dev/null
++++ b/server/query_cache.go
+@@ -0,0 +1,721 @@
++package server
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"strings"
++	"time"
++
++	"github.com/goccy/googlesqlite"
++	"go.uber.org/zap"
++	bigqueryv2 "google.golang.org/api/bigquery/v2"
++
++	"github.com/goccy/bigquery-emulator/internal/connection"
++	"github.com/goccy/bigquery-emulator/internal/logger"
++	"github.com/goccy/bigquery-emulator/internal/metadata"
++	"github.com/goccy/bigquery-emulator/internal/querycache"
++	internaltypes "github.com/goccy/bigquery-emulator/internal/types"
++)
++
++// queryCacheTTL mirrors BigQuery's documented best-effort cache lifetime
++// (roughly 24 hours): entries older than this are treated as misses even
++// when their dependencies are unchanged.
++const queryCacheTTL = 24 * time.Hour
++
++// queryCacheEnabled interprets the useQueryCache option of jobs.query /
++// jobs.insert. The option defaults to true in BigQuery; only an explicit
++// false disables the cache.
++func queryCacheEnabled(useQueryCache *bool) bool {
++	return useQueryCache == nil || *useQueryCache
++}
++
++// buildQueryCacheKey computes the stable cache key for a query request.
++// Two requests that must produce the same result (same effective project,
++// default dataset, SQL text, parameters and result-affecting options) hash
++// identically.
++func (s *Server) buildQueryCacheKey(
++	requestProjectID, effectiveProjectID, defaultDatasetID string,
++	defaultDataset *bigqueryv2.DatasetReference,
++	query string,
++	params []*bigqueryv2.QueryParameter,
++	parameterMode string,
++	connectionProperties []*bigqueryv2.ConnectionProperty,
++	useLegacySQL bool,
++) (string, error) {
++	key := &querycache.KeyInput{
++		ProjectID:            requestProjectID,
++		DefaultProjectID:     effectiveProjectID,
++		DefaultDatasetID:     defaultDatasetID,
++		Query:                query,
++		ParameterMode:        parameterMode,
++		ConnectionProperties: connectionProperties,
++		UseLegacySQL:         useLegacySQL,
++		Params:               params,
++	}
++	if defaultDataset != nil {
++		if defaultDataset.ProjectId != "" {
++			key.DefaultProjectID = defaultDataset.ProjectId
++		}
++		key.DefaultDatasetID = defaultDataset.DatasetId
++	}
++	return querycache.BuildKey(key)
++}
++
++// cacheLookup returns the cached response for key when a fresh entry exists
++// and every dependency still has its snapshotted version. A miss (including
++// any storage error or an invalid entry) is reported as false: the caller
++// recomputes the result, so cache failures never affect query correctness.
++func (s *Server) cacheLookup(ctx context.Context, tx *connection.Tx, key string) (*internaltypes.QueryResponse, bool) {
++	if err := tx.MetadataRepoMode(); err != nil {
++		logger.Logger(ctx).Warn("query cache: failed to switch metadata mode", zap.Error(err))
++		return nil, false
++	}
++	entry, err := s.metaRepo.FindQueryCacheEntry(ctx, tx.Tx(), key)
++	if err != nil {
++		logger.Logger(ctx).Warn("query cache: lookup failed", zap.Error(err))
++		return nil, false
++	}
++	if entry == nil {
++		return nil, false
++	}
++	if time.Now().Unix()-entry.CreatedAt > int64(queryCacheTTL.Seconds()) {
++		if err := s.metaRepo.DeleteQueryCacheEntry(ctx, tx.Tx(), key); err != nil {
++			logger.Logger(ctx).Warn("query cache: failed to evict expired entry", zap.Error(err))
++		}
++		return nil, false
++	}
++	var deps []metadata.Dependency
++	if entry.Dependencies != "" {
++		if err := json.Unmarshal([]byte(entry.Dependencies), &deps); err != nil {
++			logger.Logger(ctx).Warn("query cache: corrupted dependencies, evicting", zap.Error(err))
++			_ = s.metaRepo.DeleteQueryCacheEntry(ctx, tx.Tx(), key)
++			return nil, false
++		}
++	}
++	for _, dep := range deps {
++		var (
++			version int64
++			found   bool
++		)
++		switch dep.Kind {
++		case metadata.DependencyTable:
++			version, found, err = s.metaRepo.FindTableVersion(ctx, tx.Tx(), dep.ProjectID, dep.DatasetID, dep.Name)
++		case metadata.DependencyRoutine:
++			version, _, found, err = s.metaRepo.FindRoutineVersion(ctx, tx.Tx(), dep.ProjectID, dep.DatasetID, dep.Name)
++		default:
++			err = fmt.Errorf("unknown dependency kind %q", dep.Kind)
++		}
++		if err != nil {
++			logger.Logger(ctx).Warn("query cache: dependency check failed, treating as miss", zap.Error(err))
++			return nil, false
++		}
++		if !found || version != dep.Version {
++			// The entry is stale: evict it best-effort so subsequent
++			// requests repopulate from a fresh computation.
++			if delErr := s.metaRepo.DeleteQueryCacheEntry(ctx, tx.Tx(), key); delErr != nil {
++				logger.Logger(ctx).Warn("query cache: failed to evict stale entry", zap.Error(delErr))
++			}
++			return nil, false
++		}
++	}
++	var response internaltypes.QueryResponse
++	if err := json.Unmarshal([]byte(entry.Response), &response); err != nil {
++		logger.Logger(ctx).Warn("query cache: corrupted response payload, evicting", zap.Error(err))
++		_ = s.metaRepo.DeleteQueryCacheEntry(ctx, tx.Tx(), key)
++		return nil, false
++	}
++	// JSON decoding turns nested TableRow/[]*TableCell values into generic
++	// maps/slices and drops the (non-serialized) cell column names. Restore
++	// the in-memory shapes so a cache hit is indistinguishable from a fresh
++	// computation (e.g. when materializing the jobs.insert results table).
++	rehydrateResponse(&response)
++	return &response, true
++}
++
++// rehydrateResponse restores the concrete TableRow/[]*TableCell shapes and
++// column names that JSON round-trip erases from cached result rows.
++func rehydrateResponse(resp *internaltypes.QueryResponse) {
++	if resp == nil || resp.Schema == nil {
++		return
++	}
++	for _, row := range resp.Rows {
++		if row == nil {
++			continue
++		}
++		rehydrateRow(row, resp.Schema.Fields)
++	}
++}
++
++func rehydrateRow(row *internaltypes.TableRow, fields []*bigqueryv2.TableFieldSchema) {
++	for idx, cell := range row.F {
++		var field *bigqueryv2.TableFieldSchema
++		if idx < len(fields) {
++			field = fields[idx]
++		}
++		rehydrateCell(cell, field)
++	}
++}
++
++func rehydrateCell(cell *internaltypes.TableCell, field *bigqueryv2.TableFieldSchema) {
++	if cell == nil {
++		return
++	}
++	if field != nil && cell.Name == "" {
++		cell.Name = field.Name
++	}
++	switch v := cell.V.(type) {
++	case map[string]interface{}:
++		// Nested record: {"f":[{...cells...}]}
++		rawCells, ok := v["f"].([]interface{})
++		if !ok {
++			return
++		}
++		cells := make([]*internaltypes.TableCell, 0, len(rawCells))
++		for _, raw := range rawCells {
++			c := &internaltypes.TableCell{}
++			if cm, ok := raw.(map[string]interface{}); ok {
++				c.V = cm["v"]
++			}
++			cells = append(cells, c)
++		}
++		var subFields []*bigqueryv2.TableFieldSchema
++		if field != nil {
++			subFields = field.Fields
++		}
++		for idx, sub := range cells {
++			var subField *bigqueryv2.TableFieldSchema
++			if idx < len(subFields) {
++				subField = subFields[idx]
++			}
++			rehydrateCell(sub, subField)
++		}
++		cell.V = internaltypes.TableRow{F: cells}
++	case []interface{}:
++		// Repeated field: [{...cells...}, ...]; each element is shaped by
++		// the same field schema (itself for scalars, field.Fields for
++		// repeated records).
++		cells := make([]*internaltypes.TableCell, 0, len(v))
++		for _, raw := range v {
++			c := &internaltypes.TableCell{}
++			if cm, ok := raw.(map[string]interface{}); ok {
++				c.V = cm["v"]
++			} else {
++				c.V = raw
++			}
++			cells = append(cells, c)
++		}
++		for _, sub := range cells {
++			rehydrateCell(sub, field)
++		}
++		cell.V = cells
++	}
++}
++
++// cacheStore persists a freshly computed result with its dependency
++// snapshot. It is best-effort: any failure is logged and the (already
++// computed) response is still returned; the next identical request simply
++// recomputes and retries storing.
++func (s *Server) cacheStore(ctx context.Context, tx *connection.Tx, key, projectID string, response *internaltypes.QueryResponse, deps []metadata.Dependency) {
++	if err := tx.MetadataRepoMode(); err != nil {
++		logger.Logger(ctx).Warn("query cache: failed to switch metadata mode", zap.Error(err))
++		return
++	}
++	// Never persist the per-request job reference or the cache-hit marker
++	// (a stored entry describes a freshly computed result).
++	stored := *response
++	stored.JobReference = nil
++	stored.CacheHit = false
++	responseJSON, err := json.Marshal(&stored)
++	if err != nil {
++		logger.Logger(ctx).Warn("query cache: failed to encode response", zap.Error(err))
++		return
++	}
++	depsJSON, err := json.Marshal(deps)
++	if err != nil {
++		logger.Logger(ctx).Warn("query cache: failed to encode dependencies", zap.Error(err))
++		return
++	}
++	if err := s.metaRepo.PutQueryCacheEntry(ctx, tx.Tx(), &metadata.QueryCacheEntry{
++		CacheKey:     key,
++		ProjectID:    projectID,
++		Response:     string(responseJSON),
++		Dependencies: string(depsJSON),
++		CreatedAt:    time.Now().Unix(),
++	}); err != nil {
++		logger.Logger(ctx).Warn("query cache: failed to store entry", zap.Error(err))
++	}
++}
++
++// bumpTableVersion advances the version of one table or view after a
++// content or schema change. If the version table cannot be updated, the
++// whole cache is cleared so no stale result can ever be served.
++func (s *Server) bumpTableVersion(ctx context.Context, tx *connection.Tx, projectID, datasetID, tableID string) {
++	if projectID == "" || datasetID == "" || tableID == "" {
++		return
++	}
++	s.bumpVersion(ctx, tx, func() error {
++		return s.metaRepo.BumpTableVersion(ctx, tx.Tx(), projectID, datasetID, tableID)
++	}, fmt.Sprintf("table %s.%s.%s", projectID, datasetID, tableID))
++}
++
++// bumpRoutineVersion advances the version of one routine after its
++// definition changes. body (when non-empty) records the SQL definition so
++// routine references can be expanded for dependencies.
++func (s *Server) bumpRoutineVersion(ctx context.Context, tx *connection.Tx, projectID, datasetID, routineID, body string) {
++	if projectID == "" || datasetID == "" || routineID == "" {
++		return
++	}
++	s.bumpVersion(ctx, tx, func() error {
++		return s.metaRepo.BumpRoutineVersion(ctx, tx.Tx(), projectID, datasetID, routineID, body)
++	}, fmt.Sprintf("routine %s.%s.%s", projectID, datasetID, routineID))
++}
++
++func (s *Server) bumpVersion(ctx context.Context, tx *connection.Tx, bump func() error, what string) {
++	if err := tx.MetadataRepoMode(); err != nil {
++		logger.Logger(ctx).Error("query cache: metadata mode switch failed; clearing cache", zap.String("object", what), zap.Error(err))
++		s.clearQueryCache(ctx, tx)
++		return
++	}
++	if err := bump(); err != nil {
++		logger.Logger(ctx).Error("query cache: version bump failed; clearing cache to preserve correctness", zap.String("object", what), zap.Error(err))
++		s.clearQueryCache(ctx, tx)
++	}
++}
++
++// clearQueryCache drops every cached entry. Best-effort: failures are
++// logged (the in-flight change is still committed; future version bumps
++// keep invalidating entries).
++func (s *Server) clearQueryCache(ctx context.Context, tx *connection.Tx) {
++	if err := tx.MetadataRepoMode(); err != nil {
++		logger.Logger(ctx).Error("query cache: metadata mode switch failed while clearing cache", zap.Error(err))
++		return
++	}
++	if err := s.metaRepo.ClearQueryCache(ctx, tx.Tx()); err != nil {
++		logger.Logger(ctx).Error("query cache: failed to clear cache", zap.Error(err))
++	}
++}
++
++// invalidateForQuery bumps versions for every object a successfully
++// executed statement changed. It combines SQL-text derived targets
++// (DML targets, ALTER/TRUNCATE, TEMP-less CREATE/DROP, routine DDL and
++// CALLed procedures) with the engine's ChangedCatalog (which reports DDL
++// additions/deletions with full name paths and routine bodies).
++func (s *Server) invalidateForQuery(
++	ctx context.Context,
++	tx *connection.Tx,
++	defaultProjectID, defaultDatasetID, sql string,
++	changed *googlesqlite.ChangedCatalog,
++) {
++	s.invalidateForQueryImpl(ctx, tx, defaultProjectID, defaultDatasetID, sql, changed, map[string]bool{})
++}
++
++func (s *Server) invalidateForQueryImpl(
++	ctx context.Context,
++	tx *connection.Tx,
++	defaultProjectID, defaultDatasetID, sql string,
++	changed *googlesqlite.ChangedCatalog,
++	visitedRoutines map[string]bool,
++) {
++	analysis := querycache.Analyze(sql)
++	for _, target := range analysis.WriteTargets {
++		projectID, datasetID, name, ok := qualifyRef(target.Parts, defaultProjectID, defaultDatasetID)
++		if !ok {
++			continue
++		}
++		switch target.Kind {
++		case querycache.TargetTable:
++			s.bumpTableVersion(ctx, tx, projectID, datasetID, name)
++		case querycache.TargetRoutine:
++			s.bumpRoutineVersion(ctx, tx, projectID, datasetID, name, "")
++			// A CALLed procedure (or invoked function whose definition we
++			// know) can read and write tables: invalidate everything its
++			// body touches. If we cannot see the definition we cannot
++			// reason about it, so the whole cache is cleared.
++			s.invalidateForRoutineBody(ctx, tx, projectID, datasetID, name, visitedRoutines)
++		}
++	}
++	for _, dsTarget := range analysis.DropDatasets {
++		projectID := dsTarget.ProjectID
++		if projectID == "" {
++			projectID = defaultProjectID
++		}
++		if projectID == "" || dsTarget.DatasetID == "" {
++			s.clearQueryCache(ctx, tx)
++			continue
++		}
++		project, err := s.metaRepo.FindProject(ctx, projectID)
++		if err != nil || project == nil {
++			// Cannot enumerate what the drop removes: clear the cache
++			// rather than risk a stale entry.
++			s.clearQueryCache(ctx, tx)
++			continue
++		}
++		dataset := project.Dataset(dsTarget.DatasetID)
++		if dataset == nil {
++			// Dataset unknown to the metadata catalog (e.g. created
++			// entirely through SQL) so its tables cannot be enumerated;
++			// clear the cache to be safe.
++			s.clearQueryCache(ctx, tx)
++			continue
++		}
++		for _, table := range dataset.Tables() {
++			s.bumpTableVersion(ctx, tx, projectID, dsTarget.DatasetID, table.ID)
++		}
++		for _, routine := range dataset.Routines() {
++			s.bumpRoutineVersion(ctx, tx, projectID, dsTarget.DatasetID, routine.ID, "")
++		}
++	}
++	if changed != nil {
++		if changed.Table != nil {
++			for _, spec := range changed.Table.Added {
++				s.bumpSpecTable(ctx, tx, spec.NamePath)
++			}
++			for _, spec := range changed.Table.Updated {
++				s.bumpSpecTable(ctx, tx, spec.NamePath)
++			}
++			for _, spec := range changed.Table.Deleted {
++				s.bumpSpecTable(ctx, tx, spec.NamePath)
++			}
++		}
++		if changed.Function != nil {
++			for _, spec := range changed.Function.Added {
++				projectID, datasetID, name := routineNamePath(spec.NamePath, defaultProjectID, defaultDatasetID)
++				s.bumpRoutineVersion(ctx, tx, projectID, datasetID, name, spec.Body)
++			}
++			for _, spec := range changed.Function.Deleted {
++				projectID, datasetID, name := routineNamePath(spec.NamePath, defaultProjectID, defaultDatasetID)
++				s.bumpRoutineVersion(ctx, tx, projectID, datasetID, name, "")
++			}
++		}
++	}
++}
++
++// invalidateForRoutineBody re-runs invalidation against the stored SQL body
++// of a routine that was itself just bumped (typically a CALLed procedure).
++// A routine whose definition is unavailable forces a full cache clear.
++func (s *Server) invalidateForRoutineBody(ctx context.Context, tx *connection.Tx, projectID, datasetID, routineID string, visited map[string]bool) {
++	key := projectID + "|" + datasetID + "|" + routineID
++	if visited[key] {
++		return
++	}
++	visited[key] = true
++	if err := tx.MetadataRepoMode(); err != nil {
++		s.clearQueryCache(ctx, tx)
++		return
++	}
++	_, body, found, err := s.metaRepo.FindRoutineVersion(ctx, tx.Tx(), projectID, datasetID, routineID)
++	if err != nil {
++		s.clearQueryCache(ctx, tx)
++		return
++	}
++	if !found {
++		// The routine exists for the engine but is unknown to the version
++		// registry (e.g. created before the cache existed): we cannot prove
++		// which cached results it might affect.
++		s.clearQueryCache(ctx, tx)
++		return
++	}
++	if body == "" {
++		// JavaScript routines cannot reference tables; nothing to expand.
++		return
++	}
++	s.invalidateForQueryImpl(ctx, tx, projectID, datasetID, body, nil, visited)
++}
++
++func (s *Server) bumpSpecTable(ctx context.Context, tx *connection.Tx, namePath []string) {
++	projectID, datasetID, tableID, ok := tableNamePath(namePath)
++	if !ok {
++		return
++	}
++	s.bumpTableVersion(ctx, tx, projectID, datasetID, tableID)
++}
++
++// tableNamePath splits a 3-segment [project, dataset, table] name path.
++func tableNamePath(namePath []string) (string, string, string, bool) {
++	if len(namePath) != 3 {
++		return "", "", "", false
++	}
++	return namePath[0], namePath[1], namePath[2], true
++}
++
++// routineNamePath normalizes a routine name path ([dataset, routine] or
++// [project, dataset, routine]) into a fully qualified triple.
++func routineNamePath(namePath []string, defaultProjectID, defaultDatasetID string) (string, string, string) {
++	switch len(namePath) {
++	case 3:
++		return namePath[0], namePath[1], namePath[2]
++	case 2:
++		return defaultProjectID, namePath[0], namePath[1]
++	default:
++		return defaultProjectID, defaultDatasetID, strings.Join(namePath, ".")
++	}
++}
++
++// qualifyRef resolves a 1-3 part reference as written in a statement into a
++// fully qualified triple, using the statement's effective project and
++// default dataset for unqualified forms.
++func qualifyRef(parts []string, defaultProjectID, defaultDatasetID string) (string, string, string, bool) {
++	switch len(parts) {
++	case 3:
++		return parts[0], parts[1], parts[2], true
++	case 2:
++		if defaultProjectID == "" {
++			return "", "", "", false
++		}
++		return defaultProjectID, parts[0], parts[1], true
++	case 1:
++		if defaultProjectID == "" || defaultDatasetID == "" {
++			return "", "", "", false
++		}
++		return defaultProjectID, defaultDatasetID, parts[0], true
++	default:
++		return "", "", "", false
++	}
++}
++
++// resolveDependencies builds the dependency snapshot that validates a cached
++// result: every persistent table/view the statement reads (transitively,
++// expanding views and SQL routines) and every catalog routine it calls,
++// each paired with its current version. It returns ok=false when a
++// non-CTE reference cannot be resolved to a persistent object, which makes
++// the statement ineligible for caching rather than risking a stale entry.
++func (s *Server) resolveDependencies(
++	ctx context.Context,
++	tx *connection.Tx,
++	defaultProjectID, defaultDatasetID string,
++	analysis *querycache.Analysis,
++) ([]metadata.Dependency, bool) {
++	r := &depResolver{
++		s:              s,
++		ctx:            ctx,
++		tx:             tx,
++		defaultProject: defaultProjectID,
++		defaultDataset: defaultDatasetID,
++		cteNames:       analysis.CTENames,
++		deps:           map[string]*metadata.Dependency{},
++		visitedTables:  map[string]bool{},
++		visitedRoutine: map[string]bool{},
++	}
++	for _, ref := range analysis.ReadRefs {
++		if ref.Wildcard {
++			return nil, false
++		}
++		if ref.Kind == querycache.RefCall {
++			if !r.addRoutineFromRef(ref.Parts) {
++				return nil, false
++			}
++			continue
++		}
++		if !r.addTableFromRef(ref.Parts) {
++			return nil, false
++		}
++	}
++	deps := make([]metadata.Dependency, 0, len(r.deps))
++	for _, dep := range r.deps {
++		deps = append(deps, *dep)
++	}
++	return deps, true
++}
++
++type depResolver struct {
++	s              *Server
++	ctx            context.Context
++	tx             *connection.Tx
++	defaultProject string
++	defaultDataset string
++	cteNames       map[string]struct{}
++	deps           map[string]*metadata.Dependency
++	visitedTables  map[string]bool
++	visitedRoutine map[string]bool
++}
++
++func depKey(kind, projectID, datasetID, name string) string {
++	return kind + "|" + projectID + "|" + datasetID + "|" + name
++}
++
++// addTableFromRef resolves one FROM/JOIN reference to a persistent table or
++// view and records its version, expanding a view's definition (and the
++// tables/routines it references) recursively.
++func (r *depResolver) addTableFromRef(parts []string) bool {
++	if len(parts) == 1 {
++		if _, isCTE := r.cteNames[lower(parts[0])]; isCTE {
++			return true
++		}
++	}
++	projectID, datasetID, tableID, table, ok := r.resolveTable(parts)
++	if !ok {
++		// An unqualified name that is not a CTE and does not resolve to a
++		// persistent table may be a temp table or something the analysis
++		// cannot track: do not cache.
++		return false
++	}
++	key := depKey(metadata.DependencyTable, projectID, datasetID, tableID)
++	if r.visitedTables[key] {
++		return true
++	}
++	r.visitedTables[key] = true
++	if err := r.tx.MetadataRepoMode(); err != nil {
++		return false
++	}
++	version, err := r.s.metaRepo.EnsureTableVersion(r.ctx, r.tx.Tx(), projectID, datasetID, tableID)
++	if err != nil {
++		logger.Logger(r.ctx).Warn("query cache: failed to snapshot table version", zap.Error(err))
++		return false
++	}
++	r.deps[key] = &metadata.Dependency{
++		Kind:      metadata.DependencyTable,
++		ProjectID: projectID,
++		DatasetID: datasetID,
++		Name:      tableID,
++		Version:   version,
++	}
++	// Views depend on the objects their definition queries.
++	content, err := table.Content()
++	if err != nil {
++		logger.Logger(r.ctx).Warn("query cache: failed to read table content", zap.Error(err))
++		return false
++	}
++	var viewQuery string
++	switch {
++	case content.View != nil:
++		viewQuery = content.View.Query
++	case content.MaterializedView != nil:
++		viewQuery = content.MaterializedView.Query
++	}
++	if viewQuery != "" {
++		if !r.expandSQL(viewQuery, projectID, datasetID) {
++			return false
++		}
++	}
++	return true
++}
++
++// addRoutineFromRef resolves a routine-call reference and records its
++// version; SQL routine bodies are expanded for table/routine references.
++// Unresolved calls are treated as built-in functions and are not
++// dependencies (the cache only tracks catalog routines).
++func (r *depResolver) addRoutineFromRef(parts []string) bool {
++	projectID, datasetID, routineID, ok := qualifyRef(parts, r.defaultProject, r.defaultDataset)
++	if !ok {
++		// A call without a default dataset (e.g. `f()` with no default
++		// dataset) cannot be a catalog routine; ignore it like a built-in.
++		return true
++	}
++	key := depKey(metadata.DependencyRoutine, projectID, datasetID, routineID)
++	if r.visitedRoutine[key] {
++		return true
++	}
++	if err := r.tx.MetadataRepoMode(); err != nil {
++		return false
++	}
++	version, body, found, err := r.s.metaRepo.FindRoutineVersion(r.ctx, r.tx.Tx(), projectID, datasetID, routineID)
++	if err != nil {
++		logger.Logger(r.ctx).Warn("query cache: failed to look up routine version", zap.Error(err))
++		return false
++	}
++	if !found {
++		// Built-in function or a routine the registry has never seen;
++		// nothing the cache can invalidate on.
++		return true
++	}
++	r.visitedRoutine[key] = true
++	r.deps[key] = &metadata.Dependency{
++		Kind:      metadata.DependencyRoutine,
++		ProjectID: projectID,
++		DatasetID: datasetID,
++		Name:      routineID,
++		Version:   version,
++	}
++	if body != "" {
++		if !r.expandSQL(body, projectID, datasetID) {
++			return false
++		}
++	}
++	return true
++}
++
++// expandSQL analyzes one SQL definition (view query, routine body) in the
++// context of the defining object and adds its tables and routines as
++// dependencies of the cached result. It reports false when the definition
++// references an object that cannot be resolved to a persistent table, in
++// which case the enclosing statement must not be cached.
++func (r *depResolver) expandSQL(sql, defProjectID, defDatasetID string) bool {
++	// The definition owns its name-resolution scope: its CTEs apply, the
++	// enclosing query's CTEs do not.
++	sub := &depResolver{
++		s:              r.s,
++		ctx:            r.ctx,
++		tx:             r.tx,
++		defaultProject: defProjectID,
++		defaultDataset: defDatasetID,
++		cteNames:       map[string]struct{}{},
++		deps:           r.deps,
++		visitedTables:  r.visitedTables,
++		visitedRoutine: r.visitedRoutine,
++	}
++	analysis := querycache.Analyze(sql)
++	for name := range analysis.CTENames {
++		sub.cteNames[name] = struct{}{}
++	}
++	for _, ref := range analysis.ReadRefs {
++		if ref.Wildcard {
++			return false
++		}
++		if ref.Kind == querycache.RefCall {
++			// unresolved routine calls are built-ins: safe to ignore
++			_ = sub.addRoutineFromRef(ref.Parts)
++			continue
++		}
++		if !sub.addTableFromRef(ref.Parts) {
++			return false
++		}
++	}
++	return true
++}
++
++// resolveTable maps a 1-3 part reference to a persistent table in the
++// metadata catalog.
++func (r *depResolver) resolveTable(parts []string) (string, string, string, *metadata.Table, bool) {
++	var projectID, datasetID, tableID string
++	switch len(parts) {
++	case 3:
++		projectID, datasetID, tableID = parts[0], parts[1], parts[2]
++	case 2:
++		if r.defaultProject == "" {
++			return "", "", "", nil, false
++		}
++		projectID, datasetID, tableID = r.defaultProject, parts[0], parts[1]
++	case 1:
++		if r.defaultProject == "" || r.defaultDataset == "" {
++			return "", "", "", nil, false
++		}
++		projectID, datasetID, tableID = r.defaultProject, r.defaultDataset, parts[0]
++	default:
++		return "", "", "", nil, false
++	}
++	project, err := r.s.metaRepo.FindProject(r.ctx, projectID)
++	if err != nil || project == nil {
++		return "", "", "", nil, false
++	}
++	dataset := project.Dataset(datasetID)
++	if dataset == nil {
++		return "", "", "", nil, false
++	}
++	table := dataset.Table(tableID)
++	if table == nil {
++		return "", "", "", nil, false
++	}
++	return projectID, datasetID, tableID, table, true
++}
++
++func lower(s string) string {
++	out := make([]rune, 0, len(s))
++	for _, r := range s {
++		if r >= 'A' && r <= 'Z' {
++			r += 'a' - 'A'
++		}
++		out = append(out, r)
++	}
++	return string(out)
++}
+diff --git a/server/query_cache_internal_test.go b/server/query_cache_internal_test.go
+new file mode 100644
+index 0000000..1c87c88
+--- /dev/null
++++ b/server/query_cache_internal_test.go
+@@ -0,0 +1,154 @@
++package server
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"testing"
++
++	storagepb "cloud.google.com/go/bigquery/storage/apiv1/storagepb"
++	"github.com/goccy/bigquery-emulator/types"
++)
++
++func httpJSONInternal(t *testing.T, method, target, body string) (int, map[string]any) {
++	t.Helper()
++	var rdr io.Reader
++	if body != "" {
++		rdr = bytes.NewReader([]byte(body))
++	}
++	req, err := http.NewRequest(method, target, rdr)
++	if err != nil {
++		t.Fatal(err)
++	}
++	req.Header.Set("Content-Type", "application/json")
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer resp.Body.Close()
++	data, err := io.ReadAll(resp.Body)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var out map[string]any
++	if len(bytes.TrimSpace(data)) > 0 {
++		if err := json.Unmarshal(data, &out); err != nil {
++			t.Fatalf("decode (status %d): %s", resp.StatusCode, data)
++		}
++	}
++	return resp.StatusCode, out
++}
++
++func queryRowsInternal(body map[string]any) [][]string {
++	rowsRaw, _ := body["rows"].([]any)
++	rows := make([][]string, 0, len(rowsRaw))
++	for _, r := range rowsRaw {
++		fields, _ := r.(map[string]any)["f"].([]any)
++		vals := make([]string, 0, len(fields))
++		for _, f := range fields {
++			v := f.(map[string]any)["v"]
++			if v == nil {
++				vals = append(vals, "<nil>")
++				continue
++			}
++			vals = append(vals, fmt.Sprint(v))
++		}
++		rows = append(rows, vals)
++	}
++	return rows
++}
++
++// TestQueryCacheInvalidatedByStorageWrite ensures rows committed through the
++// BigQuery Storage Write API invalidate cached query results that depend on
++// the target table (the same guarantee as tabledata.insertAll / DML).
++func TestQueryCacheInvalidatedByStorageWrite(t *testing.T) {
++	const (
++		projectID = "stest"
++		datasetID = "ds"
++		tableID   = "tbl"
++	)
++	ctx := context.Background()
++	bqServer, err := New(TempStorage)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := bqServer.Load(StructSource(types.NewProject(
++		projectID,
++		types.NewDataset(datasetID,
++			types.NewTable(tableID, []*types.Column{types.NewColumn("id", types.INT64)}, nil),
++		),
++	))); err != nil {
++		t.Fatal(err)
++	}
++	ts := bqServer.TestServer()
++	defer func() { ts.Close(); bqServer.Stop(ctx) }()
++
++	postQuery := func(sql string) (int, map[string]any) {
++		body := fmt.Sprintf(`{"query":%q,"useLegacySql":false,"defaultDataset":{"projectId":%q,"datasetId":%q}}`,
++			sql, projectID, datasetID)
++		return httpJSONInternal(t, http.MethodPost, ts.URL+"/projects/"+projectID+"/queries", body)
++	}
++
++	// Prime the cache with a count over the (empty) table.
++	code, resp := postQuery("SELECT COUNT(*) AS c FROM ds.tbl")
++	if code != http.StatusOK {
++		t.Fatalf("prime query: %d (%v)", code, resp)
++	}
++	if code, resp = postQuery("SELECT COUNT(*) AS c FROM ds.tbl"); code != http.StatusOK {
++		t.Fatalf("hit query: %d (%v)", code, resp)
++	}
++	if hit, _ := resp["cacheHit"].(bool); !hit {
++		t.Fatal("expected cache hit before Storage Write")
++	}
++
++	// Commit rows through the Storage Write API batch commit path.
++	writeServer := &storageWriteServer{
++		server:    bqServer,
++		streamMap: map[string]*writeStreamStatus{},
++	}
++	streamName := fmt.Sprintf("projects/%s/datasets/%s/tables/%s/_default", projectID, datasetID, tableID)
++	if _, err := writeServer.createDefaultStream(ctx, &storagepb.GetWriteStreamRequest{Name: streamName}); err != nil {
++		t.Fatal(err)
++	}
++	status, canonicalName, err := writeServer.getOrCreateWriteStreamStatus(ctx, streamName)
++	if err != nil {
++		t.Fatal(err)
++	}
++	status.mu.Lock()
++	status.rows = types.Data{{"id": int64(1)}, {"id": int64(2)}}
++	status.mu.Unlock()
++	commitResp, err := writeServer.BatchCommitWriteStreams(ctx, &storagepb.BatchCommitWriteStreamsRequest{
++		WriteStreams: []string{canonicalName},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(commitResp.StreamErrors) != 0 {
++		t.Fatalf("batch commit errors: %v", commitResp.StreamErrors)
++	}
++
++	// The cached count must now be invalidated and the recomputed result
++	// reflect the committed rows.
++	code, resp = postQuery("SELECT COUNT(*) AS c FROM ds.tbl")
++	if code != http.StatusOK {
++		t.Fatalf("post-write query: %d (%v)", code, resp)
++	}
++	if hit, _ := resp["cacheHit"].(bool); hit {
++		t.Fatal("expected cache miss after Storage Write commit")
++	}
++	if rows := queryRowsInternal(resp); fmt.Sprint(rows) != "[[2]]" {
++		t.Fatalf("post-write result = %v, want [[2]]", rows)
++	}
++
++	// And the fresh result is cached again.
++	code, resp = postQuery("SELECT COUNT(*) AS c FROM ds.tbl")
++	if code != http.StatusOK {
++		t.Fatalf("re-hit query: %d (%v)", code, resp)
++	}
++	if hit, _ := resp["cacheHit"].(bool); !hit {
++		t.Fatal("expected cache hit after recompute")
++	}
++}
+diff --git a/server/query_cache_test.go b/server/query_cache_test.go
+new file mode 100644
+index 0000000..4a4d25b
+--- /dev/null
++++ b/server/query_cache_test.go
+@@ -0,0 +1,389 @@
++package server_test
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"path/filepath"
++	"testing"
++
++	"github.com/goccy/bigquery-emulator/server"
++	"github.com/goccy/bigquery-emulator/types"
++)
++
++const (
++	cacheProjectID = "cachetest"
++	cacheDatasetID = "d"
++)
++
++func cacheBase(base string) string {
++	return base + "/projects/" + cacheProjectID
++}
++
++func cacheQuery(t *testing.T, base, sql string, useQueryCache *bool) map[string]any {
++	t.Helper()
++	body := fmt.Sprintf(
++		`{"query":%q,"useLegacySql":false,"defaultDataset":{"projectId":%q,"datasetId":%q}}`,
++		sql, cacheProjectID, cacheDatasetID,
++	)
++	if useQueryCache != nil {
++		body = fmt.Sprintf(`{"query":%q,"useLegacySql":false,"useQueryCache":%t,"defaultDataset":{"projectId":%q,"datasetId":%q}}`,
++			sql, *useQueryCache, cacheProjectID, cacheDatasetID)
++	}
++	code, resp := httpJSON(t, http.MethodPost, cacheBase(base)+"/queries", body, nil)
++	if code != http.StatusOK {
++		t.Fatalf("jobs.query %q failed: %d (%v)", sql, code, resp)
++	}
++	return resp
++}
++
++func cacheQueryHit(t *testing.T, base, sql string) (map[string]any, bool) {
++	t.Helper()
++	resp := cacheQuery(t, base, sql, nil)
++	hit, _ := resp["cacheHit"].(bool)
++	return resp, hit
++}
++
++func cacheInsertAll(t *testing.T, base, table, rowsJSON string) {
++	t.Helper()
++	target := fmt.Sprintf("%s/datasets/%s/tables/%s/insertAll", cacheBase(base), cacheDatasetID, table)
++	if code, body := httpJSON(t, http.MethodPost, target, rowsJSON, nil); code != http.StatusOK {
++		t.Fatalf("insertAll %s: %d (%v)", table, code, body)
++	}
++}
++
++func cacheCreateTable(t *testing.T, base, table, fieldsJSON string) {
++	t.Helper()
++	body := fmt.Sprintf(
++		`{"tableReference":{"projectId":%q,"datasetId":%q,"tableId":%q},"schema":{"fields":[%s]}}`,
++		cacheProjectID, cacheDatasetID, table, fieldsJSON,
++	)
++	target := fmt.Sprintf("%s/datasets/%s/tables", cacheBase(base), cacheDatasetID)
++	if code, resp := httpJSON(t, http.MethodPost, target, body, nil); code != http.StatusOK {
++		t.Fatalf("create table %s: %d (%v)", table, code, resp)
++	}
++}
++
++func setupCacheServer(t *testing.T) (*server.Server, *server.TestServer, string) {
++	t.Helper()
++	s, err := server.New(server.TempStorage)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := s.Load(server.StructSource(types.NewProject(cacheProjectID, types.NewDataset(cacheDatasetID)))); err != nil {
++		t.Fatal(err)
++	}
++	ts := s.TestServer()
++	t.Cleanup(func() {
++		ts.Close()
++		s.Stop(context.Background())
++	})
++	return s, ts, ts.URL
++}
++
++func TestQueryCacheHitAndInvalidation(t *testing.T) {
++	_, _, base := setupCacheServer(t)
++
++	cacheCreateTable(t, base, "t",
++		`{"name":"id","type":"INTEGER"},{"name":"v","type":"STRING"}`)
++	cacheInsertAll(t, base, "t",
++		`{"rows":[{"json":{"id":"1","v":"a"}},{"json":{"id":"2","v":"b"}}]}`)
++
++	countSQL := "SELECT COUNT(*) AS c FROM d.t"
++
++	// First run: computed.
++	resp, hit := cacheQueryHit(t, base, countSQL)
++	if hit {
++		t.Fatal("first jobs.query must not be a cache hit")
++	}
++	if got := queryRows(t, resp); fmt.Sprint(got) != "[[2]]" {
++		t.Fatalf("unexpected first result: %v", got)
++	}
++	// Second identical run: served from cache.
++	if resp, hit = cacheQueryHit(t, base, countSQL); !hit {
++		t.Fatal("identical jobs.query must be a cache hit")
++	} else if got := queryRows(t, resp); fmt.Sprint(got) != "[[2]]" {
++		t.Fatalf("cached result mismatch: %v", got)
++	}
++
++	// tabledata.insertAll changes table content: cache must invalidate.
++	cacheInsertAll(t, base, "t", `{"rows":[{"json":{"id":"3","v":"c"}}]}`)
++	if resp, hit = cacheQueryHit(t, base, countSQL); hit {
++		t.Fatal("query after insertAll must be a cache miss")
++	} else if got := queryRows(t, resp); fmt.Sprint(got) != "[[3]]" {
++		t.Fatalf("unexpected post-insert result: %v", got)
++	}
++	if _, hit = cacheQueryHit(t, base, countSQL); !hit {
++		t.Fatal("query must hit again after recompute")
++	}
++
++	// DML (INSERT) through jobs.query invalidates dependent results.
++	cacheQuery(t, base, "INSERT INTO d.t (id, v) VALUES (4, 'd')", nil)
++	if resp, hit = cacheQueryHit(t, base, countSQL); hit {
++		t.Fatal("query after DML must be a cache miss")
++	} else if got := queryRows(t, resp); fmt.Sprint(got) != "[[4]]" {
++		t.Fatalf("unexpected post-DML result: %v", got)
++	}
++	if _, hit = cacheQueryHit(t, base, countSQL); !hit {
++		t.Fatal("query must hit after DML recompute")
++	}
++
++	// Explicit useQueryCache=false bypasses both read and write; the
++	// previously computed entry stays valid.
++	noCache := false
++	resp = cacheQuery(t, base, countSQL, &noCache)
++	if h, _ := resp["cacheHit"].(bool); h {
++		t.Fatal("useQueryCache=false must not return a cache hit")
++	}
++	if _, hit = cacheQueryHit(t, base, countSQL); !hit {
++		t.Fatal("valid cache entry must survive a useQueryCache=false run")
++	}
++}
++
++func TestQueryCacheUnrelatedTableChange(t *testing.T) {
++	_, _, base := setupCacheServer(t)
++
++	cacheCreateTable(t, base, "t", `{"name":"id","type":"INTEGER"}`)
++	cacheCreateTable(t, base, "u", `{"name":"id","type":"INTEGER"}`)
++	cacheInsertAll(t, base, "t", `{"rows":[{"json":{"id":"1"}}]}`)
++	cacheInsertAll(t, base, "u", `{"rows":[{"json":{"id":"1"}}]}`)
++
++	// Populate the cache for both tables' queries.
++	if _, hit := cacheQueryHit(t, base, "SELECT COUNT(*) AS c FROM d.t"); hit {
++		t.Fatal("first run must miss")
++	}
++	if _, hit := cacheQueryHit(t, base, "SELECT COUNT(*) AS c FROM d.u"); hit {
++		t.Fatal("first run must miss")
++	}
++	if _, hit := cacheQueryHit(t, base, "SELECT COUNT(*) AS c FROM d.t"); !hit {
++		t.Fatal("t query must hit")
++	}
++	if _, hit := cacheQueryHit(t, base, "SELECT COUNT(*) AS c FROM d.u"); !hit {
++		t.Fatal("u query must hit")
++	}
++
++	// Changing only u must not invalidate t.
++	cacheInsertAll(t, base, "u", `{"rows":[{"json":{"id":"2"}}]}`)
++	if _, hit := cacheQueryHit(t, base, "SELECT COUNT(*) AS c FROM d.t"); !hit {
++		t.Fatal("unrelated table change must not invalidate t query")
++	}
++	if resp, hit := cacheQueryHit(t, base, "SELECT COUNT(*) AS c FROM d.u"); hit {
++		t.Fatal("u query must miss after u changed")
++	} else if got := queryRows(t, resp); fmt.Sprint(got) != "[[2]]" {
++		t.Fatalf("u result after insert: %v", got)
++	}
++}
++
++func TestQueryCacheViewDependency(t *testing.T) {
++	_, _, base := setupCacheServer(t)
++
++	cacheCreateTable(t, base, "t", `{"name":"id","type":"INTEGER"}`)
++	cacheInsertAll(t, base, "t", `{"rows":[{"json":{"id":"1"}},{"json":{"id":"2"}},{"json":{"id":"3"}}]}`)
++
++	// Create a view referencing t.
++	viewBody := fmt.Sprintf(
++		`{"tableReference":{"projectId":%q,"datasetId":%q,"tableId":"v"},"view":{"query":"SELECT id * 2 AS doubled FROM d.t"}}`,
++		cacheProjectID, cacheDatasetID)
++	target := fmt.Sprintf("%s/datasets/%s/tables", cacheBase(base), cacheDatasetID)
++	if code, resp := httpJSON(t, http.MethodPost, target, viewBody, nil); code != http.StatusOK {
++		t.Fatalf("create view: %d (%v)", code, resp)
++	}
++
++	viewSQL := "SELECT SUM(doubled) AS s FROM d.v"
++	resp, hit := cacheQueryHit(t, base, viewSQL)
++	if hit {
++		t.Fatal("first view query must miss")
++	}
++	if got := queryRows(t, resp); fmt.Sprint(got) != "[[12]]" {
++		t.Fatalf("unexpected view result: %v", got)
++	}
++	if _, hit = cacheQueryHit(t, base, viewSQL); !hit {
++		t.Fatal("view query must hit")
++	}
++
++	// A change to the underlying table must invalidate results read
++	// through the view.
++	cacheInsertAll(t, base, "t", `{"rows":[{"json":{"id":"4"}}]}`)
++	if resp, hit = cacheQueryHit(t, base, viewSQL); hit {
++		t.Fatal("view query must miss after underlying table change")
++	} else if got := queryRows(t, resp); fmt.Sprint(got) != "[[20]]" {
++		t.Fatalf("view result after change: %v", got)
++	}
++}
++
++func TestQueryCacheBypassConditions(t *testing.T) {
++	_, _, base := setupCacheServer(t)
++
++	// Non-deterministic functions are never cached.
++	for i := 0; i < 2; i++ {
++		resp := cacheQuery(t, base, "SELECT RAND() AS r", nil)
++		if h, _ := resp["cacheHit"].(bool); h {
++			t.Fatalf("RAND() query %d must not be a cache hit", i+1)
++		}
++	}
++	for i := 0; i < 2; i++ {
++		resp := cacheQuery(t, base, "SELECT CURRENT_TIMESTAMP() AS ts", nil)
++		if h, _ := resp["cacheHit"].(bool); h {
++			t.Fatalf("CURRENT_TIMESTAMP() query %d must not be a cache hit", i+1)
++		}
++	}
++
++	// Queries with a destination table bypass the cache.
++	cacheCreateTable(t, base, "t", `{"name":"id","type":"INTEGER"}`)
++	jobBody := fmt.Sprintf(
++		`{"configuration":{"query":{"query":"SELECT 1 AS x","useLegacySql":false,"destinationTable":{"projectId":%q,"datasetId":%q,"tableId":"dst"},"defaultDataset":{"projectId":%q,"datasetId":%q}}}}`,
++		cacheProjectID, cacheDatasetID, cacheProjectID, cacheDatasetID)
++	for i := 0; i < 2; i++ {
++		code, job := httpJSON(t, http.MethodPost, cacheBase(base)+"/jobs", jobBody, nil)
++		if code != http.StatusOK {
++			t.Fatalf("jobs.insert failed: %d (%v)", code, job)
++		}
++		stats, _ := job["statistics"].(map[string]any)
++		queryStats, _ := stats["query"].(map[string]any)
++		if h, _ := queryStats["cacheHit"].(bool); h {
++			t.Fatalf("query job %d with destination table must not cache-hit", i+1)
++		}
++	}
++
++	// Parameters are part of the cache key: distinct values never alias.
++	p1 := fmt.Sprintf(`{"query":"SELECT @p AS x","useLegacySql":false,"parameterMode":"NAMED","queryParameters":[{"name":"p","parameterType":{"type":"INT64"},"parameterValue":{"value":"1"}}],"defaultDataset":{"projectId":%q,"datasetId":%q}}`, cacheProjectID, cacheDatasetID)
++	p2 := fmt.Sprintf(`{"query":"SELECT @p AS x","useLegacySql":false,"parameterMode":"NAMED","queryParameters":[{"name":"p","parameterType":{"type":"INT64"},"parameterValue":{"value":"2"}}],"defaultDataset":{"projectId":%q,"datasetId":%q}}`, cacheProjectID, cacheDatasetID)
++	for _, body := range []string{p1, p2, p1, p2} {
++		code, resp := httpJSON(t, http.MethodPost, cacheBase(base)+"/queries", body, nil)
++		if code != http.StatusOK {
++			t.Fatalf("parameterized query failed: %d (%v)", code, resp)
++		}
++	}
++	if _, hit := cacheQueryHit(t, base, "SELECT 1 AS x"); hit {
++		t.Fatal("distinct request shapes must not share cache entries")
++	}
++}
++
++func TestQueryCacheJobsInsertConsistency(t *testing.T) {
++	_, _, base := setupCacheServer(t)
++	cacheCreateTable(t, base, "t", `{"name":"id","type":"INTEGER"}`)
++	cacheInsertAll(t, base, "t", `{"rows":[{"json":{"id":"1"}},{"json":{"id":"2"}},{"json":{"id":"3"}}]}`)
++
++	insertJob := func() map[string]any {
++		t.Helper()
++		body := fmt.Sprintf(
++			`{"configuration":{"query":{"query":"SELECT COUNT(*) AS c FROM d.t","useLegacySql":false,"defaultDataset":{"projectId":%q,"datasetId":%q}}}}`,
++			cacheProjectID, cacheDatasetID)
++		code, job := httpJSON(t, http.MethodPost, cacheBase(base)+"/jobs", body, nil)
++		if code != http.StatusOK {
++			t.Fatalf("jobs.insert failed: %d (%v)", code, job)
++		}
++		return job
++	}
++	cacheHitFromJob := func(job map[string]any) bool {
++		stats, _ := job["statistics"].(map[string]any)
++		queryStats, _ := stats["query"].(map[string]any)
++		h, _ := queryStats["cacheHit"].(bool)
++		return h
++	}
++
++	first := insertJob()
++	if cacheHitFromJob(first) {
++		t.Fatal("first jobs.insert must not cache-hit")
++	}
++	second := insertJob()
++	if !cacheHitFromJob(second) {
++		t.Fatal("second jobs.insert must cache-hit")
++	}
++
++	// jobs.get reports the same cacheHit as the job returned by insert.
++	jobRef, _ := second["jobReference"].(map[string]any)
++	jobID, _ := jobRef["jobId"].(string)
++	code, gotJob := httpJSON(t, http.MethodGet, fmt.Sprintf("%s/jobs/%s", cacheBase(base), jobID), "", nil)
++	if code != http.StatusOK {
++		t.Fatalf("jobs.get failed: %d (%v)", code, gotJob)
++	}
++	if !cacheHitFromJob(gotJob) {
++		t.Fatal("jobs.get must report the same cacheHit=true as the inserted job")
++	}
++
++	// getQueryResults returns the same rows and schema for the cached job.
++	code, results := httpJSON(t, http.MethodGet, fmt.Sprintf("%s/queries/%s", cacheBase(base), jobID), "", nil)
++	if code != http.StatusOK {
++		t.Fatalf("getQueryResults failed: %d (%v)", code, results)
++	}
++	if total, _ := results["totalRows"].(string); total != "1" {
++		t.Fatalf("getQueryResults totalRows = %q, want 1", total)
++	}
++	if complete, _ := results["jobComplete"].(bool); !complete {
++		t.Fatal("cached job must be complete")
++	}
++	if rows := queryRows(t, results); fmt.Sprint(rows) != "[[3]]" {
++		t.Fatalf("getQueryResults rows = %v, want [[3]]", rows)
++	}
++
++	// jobs.query and jobs.insert see the same underlying cached result.
++	resp, hit := cacheQueryHit(t, base, "SELECT COUNT(*) AS c FROM d.t")
++	if !hit {
++		t.Fatal("jobs.query must hit the entry populated by jobs.insert")
++	}
++	if rows := queryRows(t, resp); fmt.Sprint(rows) != "[[3]]" {
++		t.Fatalf("jobs.query rows = %v, want [[3]]", rows)
++	}
++}
++
++func TestQueryCachePersistedRestart(t *testing.T) {
++	const tableID = "t1"
++	ctx := context.Background()
++	dbFile := filepath.Join(t.TempDir(), "emulator.db")
++	storage := server.Storage(fmt.Sprintf("file:%s?cache=shared", dbFile))
++
++	startRun := func() (*server.Server, *server.TestServer, string) {
++		t.Helper()
++		s, err := server.New(storage)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if err := s.SetProject(cacheProjectID); err != nil {
++			t.Fatal(err)
++		}
++		if err := s.Load(server.StructSource(types.NewProject(cacheProjectID, types.NewDataset(cacheDatasetID)))); err != nil {
++			t.Fatalf("loading persisted project must be idempotent: %+v", err)
++		}
++		ts := s.TestServer()
++		return s, ts, ts.URL
++	}
++
++	s1, ts1, base1 := startRun()
++	cacheCreateTable(t, base1, tableID, `{"name":"id","type":"INTEGER"}`)
++	cacheInsertAll(t, base1, tableID, `{"rows":[{"json":{"id":"1"}},{"json":{"id":"2"}}]}`)
++	sql := fmt.Sprintf("SELECT COUNT(*) AS c FROM d.%s", tableID)
++	if resp, hit := cacheQueryHit(t, base1, sql); hit {
++		t.Fatal("first query must miss")
++	} else if got := queryRows(t, resp); fmt.Sprint(got) != "[[2]]" {
++		t.Fatalf("unexpected first result: %v", got)
++	}
++	if _, hit := cacheQueryHit(t, base1, sql); !hit {
++		t.Fatal("second query must hit before restart")
++	}
++	ts1.Close()
++	if err := s1.Stop(ctx); err != nil {
++		t.Fatal(err)
++	}
++
++	// Reopen the same persisted database: the cached entry survives and
++	// validates against the persisted table versions.
++	s2, ts2, base2 := startRun()
++	defer func() {
++		ts2.Close()
++		s2.Stop(ctx)
++	}()
++	if resp, hit := cacheQueryHit(t, base2, sql); !hit {
++		t.Fatal("query must hit cached entry after restart when data is unchanged")
++	} else if got := queryRows(t, resp); fmt.Sprint(got) != "[[2]]" {
++		t.Fatalf("cached post-restart result mismatch: %v", got)
++	}
++
++	// Mutating the table after restart must invalidate the persisted entry.
++	cacheInsertAll(t, base2, tableID, `{"rows":[{"json":{"id":"3"}}]}`)
++	if resp, hit := cacheQueryHit(t, base2, sql); hit {
++		t.Fatal("query must miss after table change post-restart")
++	} else if got := queryRows(t, resp); fmt.Sprint(got) != "[[3]]" {
++		t.Fatalf("result after change: %v", got)
++	}
++}
+diff --git a/server/storage_handler.go b/server/storage_handler.go
+index 42a44e2..a6940d5 100644
+--- a/server/storage_handler.go
++++ b/server/storage_handler.go
+@@ -552,6 +552,9 @@ func (s *storageWriteServer) appendRows(req *storagepb.AppendRowsRequest, msgDes
+ 			s.sendErrorMessage(stream, streamName, err)
+ 			return nil, "", err
+ 		}
++		// Rows appended through the Storage Write API change the table
++		// content: invalidate cached results that depend on it.
++		s.server.bumpTableVersion(ctx, tx, status.projectID, status.datasetID, status.tableID)
+ 		if err := tx.Commit(); err != nil {
+ 			s.sendErrorMessage(stream, streamName, err)
+ 			return nil, "", err
+@@ -829,6 +832,9 @@ func (s *storageWriteServer) BatchCommitWriteStreams(ctx context.Context, req *s
+ 			streamErrors = append(streamErrors, s.createUnspecifiedStorageError(streamName, err))
+ 			continue
+ 		}
++		// Committing a buffered/streamed write changes the table content:
++		// invalidate cached results that depend on it.
++		s.server.bumpTableVersion(ctx, tx, status.projectID, status.datasetID, status.tableID)
+ 		if err := tx.Commit(); err != nil {
+ 			streamErrors = append(streamErrors, s.createUnspecifiedStorageError(streamName, err))
+ 		}
+@@ -876,6 +882,9 @@ func (s *storageWriteServer) FlushRows(ctx context.Context, req *storagepb.Flush
+ 	if err := s.insertTableData(ctx, tx, status, rows); err != nil {
+ 		return nil, err
+ 	}
++	// Flushing buffered rows changes the table content: invalidate cached
++	// results that depend on it.
++	s.server.bumpTableVersion(ctx, tx, status.projectID, status.datasetID, status.tableID)
+ 	if err := tx.Commit(); err != nil {
+ 		return nil, err
+ 	}

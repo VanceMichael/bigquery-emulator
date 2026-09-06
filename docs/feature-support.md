@@ -132,6 +132,19 @@ There is no `models.insert` in the BigQuery API — models are created with
 | Extract | ✅ | See [section 5](#5-data-export). |
 | Copy | ❌ | Table copy jobs are not implemented. |
 
+### 2.1 Query result cache
+
+Read-only, deterministic `SELECT` results are cached best-effort, matching
+BigQuery behavior:
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| `useQueryCache` (default enabled) | ✅ | `useQueryCache: false` always bypasses the cache. |
+| `cacheHit` statistics | ✅ | Reported on `jobs.query` and on job statistics (`jobs.get`), including for `jobs.insert` query jobs and `getQueryResults` consistency. |
+| Invalidation on table change | ✅ | DML/DDL, `tabledata.insertAll`, load jobs, the Storage Write API, and table/view create/update/delete invalidate cached results depending on those objects (transitively through views and SQL routines). Changes to unrelated tables do not invalidate entries. |
+| Non-cacheable queries | ✅ | Destination-table jobs, dry runs, multi-statement scripts, TEMP objects, wildcard tables, `INFORMATION_SCHEMA`, non-deterministic functions (`RAND()`, `CURRENT_TIMESTAMP()`, `NOW()`, `GENERATE_UUID()`, ...), and unresolvable/session-scoped references bypass the cache. |
+| Persistence | ✅ | The cache and per-object version stamps live in the metadata database; entries survive restart and are evicted after 24h. |
+
 ---
 
 ## 3. Storage and table types

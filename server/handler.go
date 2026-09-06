@@ -31,6 +31,7 @@ import (
 	"github.com/goccy/bigquery-emulator/internal/contentdata"
 	"github.com/goccy/bigquery-emulator/internal/logger"
 	"github.com/goccy/bigquery-emulator/internal/metadata"
+	"github.com/goccy/bigquery-emulator/internal/querycache"
 	internaltypes "github.com/goccy/bigquery-emulator/internal/types"
 	"github.com/goccy/bigquery-emulator/types"
 	"github.com/parquet-go/parquet-go"
@@ -689,6 +690,13 @@ func (h *uploadContentHandler) Handle(ctx context.Context, r *uploadContentReque
 	if err := r.server.contentRepo.AddTableData(ctx, tx, tableRef.ProjectId, tableRef.DatasetId, tableDef); err != nil {
 		return err
 	}
+	// A load job replaces or appends the destination table content:
+	// invalidate cached results that depend on it.
+	projectID := tableRef.ProjectId
+	if projectID == "" {
+		projectID = r.project.ID
+	}
+	r.server.bumpTableVersion(ctx, tx, projectID, tableRef.DatasetId, tableRef.TableId)
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -857,6 +865,9 @@ func (h *datasetsDeleteHandler) Handle(ctx context.Context, r *datasetsDeleteReq
 				ID:     table.ID,
 				IsView: table.IsView(),
 			})
+			// Every cached result that depended on a dropped table must be
+			// invalidated.
+			r.server.bumpTableVersion(ctx, tx, r.project.ID, r.dataset.ID, table.ID)
 		}
 		if err := r.server.contentRepo.DeleteTables(ctx, tx, r.project.ID, r.dataset.ID, deletions); err != nil {
 			return fmt.Errorf("failed to delete tables: %w", err)
@@ -1740,6 +1751,32 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		return nil, fmt.Errorf("unspecified job configuration query")
 	}
 	queryProjectID, datasetID := queryProjectAndDataset(job.Configuration.Query.DefaultDataset, r.project.ID)
+	analysis := querycache.Analyze(job.Configuration.Query.Query)
+	hasDestinationTable := job.Configuration.Query.DestinationTable != nil
+	canCache := !job.Configuration.DryRun &&
+		!hasDestinationTable &&
+		!job.Configuration.Query.CreateSession &&
+		queryCacheEnabled(job.Configuration.Query.UseQueryCache) &&
+		analysis.Cacheable
+	var cacheKey string
+	if canCache {
+		key, keyErr := r.server.buildQueryCacheKey(
+			r.project.ID,
+			queryProjectID,
+			datasetID,
+			job.Configuration.Query.DefaultDataset,
+			job.Configuration.Query.Query,
+			job.Configuration.Query.QueryParameters,
+			job.Configuration.Query.ParameterMode,
+			job.Configuration.Query.ConnectionProperties,
+			job.Configuration.Query.UseLegacySql != nil && *job.Configuration.Query.UseLegacySql,
+		)
+		if keyErr != nil {
+			canCache = false
+		} else {
+			cacheKey = key
+		}
+	}
 	conn, err := r.server.connMgr.Connection(ctx, queryProjectID, datasetID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connection: %w", err)
@@ -1749,17 +1786,42 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		return nil, fmt.Errorf("failed to start transaction: %w", err)
 	}
 	defer tx.RollbackIfNotCommitted()
-	hasDestinationTable := job.Configuration.Query.DestinationTable != nil
 	startTime := time.Now()
-	response, jobErr := r.server.contentRepo.Query(
-		ctx,
-		tx,
-		queryProjectID,
-		datasetID,
-		job.Configuration.Query.Query,
-		job.Configuration.Query.QueryParameters,
+	var (
+		response *internaltypes.QueryResponse
+		jobErr   error
+		cacheHit bool
 	)
+	// A validated cache entry skips execution entirely: the job still gets
+	// its anonymous results table (clients read results through the
+	// destination reference) and reports cacheHit=true with zero bytes
+	// processed, exactly like real BigQuery.
+	if canCache {
+		if cached, hit := r.server.cacheLookup(ctx, tx, cacheKey); hit {
+			response = cached
+			cacheHit = true
+		}
+	}
+	if !cacheHit {
+		response, jobErr = r.server.contentRepo.Query(
+			ctx,
+			tx,
+			queryProjectID,
+			datasetID,
+			job.Configuration.Query.Query,
+			job.Configuration.Query.QueryParameters,
+		)
+	}
 	endTime := time.Now()
+	if job.JobReference == nil {
+		// A job reference is optional on insert; allocate one so the
+		// server-generated job id has somewhere to live (most clients
+		// supply their own reference, but a bare request must not panic).
+		job.JobReference = &bigqueryv2.JobReference{ProjectId: r.project.ID}
+	}
+	if job.JobReference.ProjectId == "" {
+		job.JobReference.ProjectId = r.project.ID
+	}
 	if job.JobReference.JobId == "" {
 		job.JobReference.JobId = randomID() // generate job id
 	}
@@ -1804,6 +1866,9 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 			if err := r.server.contentRepo.AddTableData(ctx, tx, destinationProject.ID, tableRef.DatasetId, tableDef); err != nil {
 				return nil, fmt.Errorf("failed to add table data: %w", err)
 			}
+			// Writing to a destination table changes its content/schema:
+			// invalidate every cached result that depends on it.
+			r.server.bumpTableVersion(ctx, tx, destinationProject.ID, tableRef.DatasetId, tableRef.TableId)
 		} else if response != nil && response.Schema != nil && len(response.Schema.Fields) > 0 {
 			// A query that produces a result set (a SELECT, as opposed to a
 			// DDL/DML statement that has no result schema) still gets an
@@ -1834,12 +1899,12 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 	}
 	job.Status = status
 	var totalBytes int64
-	if response != nil {
+	if response != nil && !cacheHit {
 		totalBytes = response.TotalBytes
 	}
 	job.Statistics = &bigqueryv2.JobStatistics{
 		Query: &bigqueryv2.JobStatistics2{
-			CacheHit:            false,
+			CacheHit:            cacheHit,
 			StatementType:       "SELECT",
 			TotalBytesBilled:    totalBytes,
 			TotalBytesProcessed: totalBytes,
@@ -1848,6 +1913,21 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		StartTime:           startTime.Unix(),
 		EndTime:             endTime.Unix(),
 		TotalBytesProcessed: totalBytes,
+	}
+	if !job.Configuration.DryRun && !cacheHit {
+		// Bump versions for every object this statement changed
+		// (DML/DDL targets, routines). On a cache hit nothing ran.
+		if jobErr == nil {
+			r.server.invalidateForQuery(ctx, tx, queryProjectID, datasetID, job.Configuration.Query.Query, response.ChangedCatalog)
+			// Populate the cache for a freshly computed, read-only,
+			// deterministic result whose references all resolve.
+			if canCache && response != nil && response.Schema != nil && len(response.Schema.Fields) > 0 &&
+				(response.ChangedCatalog == nil || !response.ChangedCatalog.Changed()) {
+				if deps, ok := r.server.resolveDependencies(ctx, tx, queryProjectID, datasetID, analysis); ok {
+					r.server.cacheStore(ctx, tx, cacheKey, r.project.ID, response, deps)
+				}
+			}
+		}
 	}
 	if err := r.project.AddJob(
 		ctx,
@@ -1867,7 +1947,7 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		if err := tx.Commit(); err != nil {
 			return nil, fmt.Errorf("failed to commit job: %w", err)
 		}
-		if response != nil && response.ChangedCatalog.Changed() {
+		if !cacheHit && response != nil && response.ChangedCatalog != nil && response.ChangedCatalog.Changed() {
 			if err := syncCatalog(ctx, r.server, response.ChangedCatalog); err != nil {
 				return nil, err
 			}
@@ -2122,6 +2202,30 @@ type jobsQueryRequest struct {
 
 func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*internaltypes.QueryResponse, error) {
 	queryProjectID, datasetID := queryProjectAndDataset(r.queryRequest.DefaultDataset, r.project.ID)
+	analysis := querycache.Analyze(r.queryRequest.Query)
+	canCache := !r.queryRequest.DryRun &&
+		!r.queryRequest.CreateSession &&
+		queryCacheEnabled(r.queryRequest.UseQueryCache) &&
+		analysis.Cacheable
+	var cacheKey string
+	if canCache {
+		key, err := r.server.buildQueryCacheKey(
+			r.project.ID,
+			queryProjectID,
+			datasetID,
+			r.queryRequest.DefaultDataset,
+			r.queryRequest.Query,
+			r.queryRequest.QueryParameters,
+			r.queryRequest.ParameterMode,
+			r.queryRequest.ConnectionProperties,
+			r.queryRequest.UseLegacySql != nil && *r.queryRequest.UseLegacySql,
+		)
+		if err != nil {
+			canCache = false
+		} else {
+			cacheKey = key
+		}
+	}
 	conn, err := r.server.connMgr.Connection(ctx, queryProjectID, datasetID)
 	if err != nil {
 		return nil, err
@@ -2132,16 +2236,32 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 	}
 	defer tx.RollbackIfNotCommitted()
 	startTime := time.Now()
-	response, queryErr := r.server.contentRepo.Query(
-		ctx,
-		tx,
-		queryProjectID,
-		datasetID,
-		r.queryRequest.Query,
-		r.queryRequest.QueryParameters,
+	var (
+		response *internaltypes.QueryResponse
+		queryErr error
+		cacheHit bool
 	)
-	if queryErr != nil {
-		return nil, queryErr
+	// A validated cache entry skips execution entirely: the result is
+	// reused as-is and a fresh job records the hit, exactly like real
+	// BigQuery (cache hits bill and process zero bytes).
+	if canCache {
+		if cached, hit := r.server.cacheLookup(ctx, tx, cacheKey); hit {
+			response = cached
+			cacheHit = true
+		}
+	}
+	if !cacheHit {
+		response, queryErr = r.server.contentRepo.Query(
+			ctx,
+			tx,
+			queryProjectID,
+			datasetID,
+			r.queryRequest.Query,
+			r.queryRequest.QueryParameters,
+		)
+		if queryErr != nil {
+			return nil, queryErr
+		}
 	}
 	endTime := time.Now()
 	// jobs.query allocates jobIDs server-side (real BigQuery does the
@@ -2167,7 +2287,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 	// returns to the caller; DryRun queries skip both the AddJob and the
 	// Commit so they remain side-effect-free.
 	var totalBytes int64
-	if response != nil {
+	if response != nil && !cacheHit {
 		totalBytes = response.TotalBytes
 	}
 	job := &bigqueryv2.Job{
@@ -2190,7 +2310,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		Status: &bigqueryv2.JobStatus{State: "DONE"},
 		Statistics: &bigqueryv2.JobStatistics{
 			Query: &bigqueryv2.JobStatistics2{
-				CacheHit:            false,
+				CacheHit:            cacheHit,
 				StatementType:       "SELECT",
 				TotalBytesBilled:    totalBytes,
 				TotalBytesProcessed: totalBytes,
@@ -2208,6 +2328,20 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		),
 	}
 	if !r.queryRequest.DryRun {
+		if !cacheHit {
+			// Bump versions for everything this statement changed
+			// (DML/DDL targets, routines). On a cache hit nothing runs,
+			// so nothing can have changed.
+			r.server.invalidateForQuery(ctx, tx, queryProjectID, datasetID, r.queryRequest.Query, response.ChangedCatalog)
+			// Populate the cache for a freshly computed, read-only,
+			// deterministic result whose references all resolve.
+			if canCache && response != nil && response.Schema != nil && len(response.Schema.Fields) > 0 &&
+				(response.ChangedCatalog == nil || !response.ChangedCatalog.Changed()) {
+				if deps, ok := r.server.resolveDependencies(ctx, tx, queryProjectID, datasetID, analysis); ok {
+					r.server.cacheStore(ctx, tx, cacheKey, r.project.ID, response, deps)
+				}
+			}
+		}
 		if err := r.project.AddJob(
 			ctx,
 			tx.Tx(),
@@ -2225,7 +2359,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		if err := tx.Commit(); err != nil {
 			return nil, err
 		}
-		if response.ChangedCatalog.Changed() {
+		if !cacheHit && response.ChangedCatalog != nil && response.ChangedCatalog.Changed() {
 			if err := syncCatalog(ctx, r.server, response.ChangedCatalog); err != nil {
 				return nil, err
 			}
@@ -2233,6 +2367,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 	}
 	response.Rows = internaltypes.Format(response.Schema, response.Rows, r.useInt64Timestamp)
 	response.JobReference = job.JobReference
+	response.CacheHit = cacheHit
 	return response, nil
 }
 
@@ -2553,6 +2688,22 @@ func (h *routinesInsertHandler) Handle(ctx context.Context, r *routinesInsertReq
 	if err := r.server.contentRepo.AddRoutineByMetaData(ctx, tx, r.routine); err != nil {
 		return nil, err
 	}
+	// A routine definition changes the results of queries that call it.
+	// Record its version (and SQL body, so routine references can be
+	// expanded for table dependencies).
+	projectID, datasetID, routineID := r.project.ID, r.dataset.ID, ""
+	if ref := r.routine.RoutineReference; ref != nil {
+		if ref.ProjectId != "" {
+			projectID = ref.ProjectId
+		}
+		if ref.DatasetId != "" {
+			datasetID = ref.DatasetId
+		}
+		routineID = ref.RoutineId
+	}
+	if routineID != "" {
+		r.server.bumpRoutineVersion(ctx, tx, projectID, datasetID, routineID, r.routine.DefinitionBody)
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -2849,6 +3000,9 @@ func (h *tabledataInsertAllHandler) Handle(ctx context.Context, r *tabledataInse
 		if err := r.server.contentRepo.AddTableData(ctx, tx, r.project.ID, r.dataset.ID, tableDef); err != nil {
 			return nil, err
 		}
+		// Inserted rows change the table content: invalidate cached results
+		// that depend on it.
+		r.server.bumpTableVersion(ctx, tx, r.table.ProjectID, r.table.DatasetID, r.table.ID)
 		if err := tx.Commit(); err != nil {
 			return nil, err
 		}
@@ -2959,6 +3113,11 @@ func (h *tablesDeleteHandler) Handle(ctx context.Context, r *tablesDeleteRequest
 	); err != nil {
 		return fmt.Errorf("failed to delete table %s: %w", r.table.ID, err)
 	}
+	// Dropping the table (or view) invalidates every cached result that
+	// depended on it. The version advances to a fresh global value so a
+	// later table recreated under the same name can never satisfy an old
+	// snapshot.
+	r.server.bumpTableVersion(ctx, tx, r.project.ID, r.dataset.ID, r.table.ID)
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -3180,6 +3339,10 @@ func (h *tablesInsertHandler) Handle(ctx context.Context, r *tablesInsertRequest
 			return nil, errInternalError(err.Error())
 		}
 	}
+	// A new table or view is a catalog change: invalidate cached results
+	// that depend on the name (and, for CREATE OR REPLACE-like paths, the
+	// new generation).
+	r.server.bumpTableVersion(ctx, tx, r.project.ID, r.dataset.ID, r.table.TableReference.TableId)
 	if err := tx.Commit(); err != nil {
 		return nil, errInternalError(fmt.Errorf("failed to commit table: %w", err).Error())
 	}
@@ -3384,6 +3547,9 @@ func (h *tablesPatchHandler) Handle(ctx context.Context, r *tablesPatchRequest) 
 	if err := r.table.Patch(ctx, tx.Tx(), tableMetadata); err != nil {
 		return nil, err
 	}
+	// Metadata edits may change the view definition or other
+	// result-affecting attributes, so invalidate cached results on it.
+	r.server.bumpTableVersion(ctx, tx, r.project.ID, r.dataset.ID, r.table.ID)
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -3489,6 +3655,9 @@ func (h *tablesUpdateHandler) Handle(ctx context.Context, r *tablesUpdateRequest
 	if err := r.table.Replace(ctx, tx.Tx(), tableMetadata); err != nil {
 		return nil, err
 	}
+	// The resource was fully replaced (possibly including a view query),
+	// so invalidate cached results that depend on this table.
+	r.server.bumpTableVersion(ctx, tx, r.project.ID, r.dataset.ID, r.table.ID)
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}

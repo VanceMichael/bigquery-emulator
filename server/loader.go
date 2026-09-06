@@ -110,5 +110,8 @@ func (s *Server) addTableData(ctx context.Context, tx *connection.Tx, project *t
 	if err := s.contentRepo.AddTableData(ctx, tx, project.ID, dataset.ID, table); err != nil {
 		return err
 	}
+	// Seeding (or re-seeding on restart) replaces the table content: any
+	// cached result depending on it must be invalidated.
+	s.bumpTableVersion(ctx, tx, project.ID, dataset.ID, table.ID)
 	return nil
 }
