@@ -1,0 +1,1104 @@
+diff --git a/docs/feature-support.md b/docs/feature-support.md
+index 8729607..8cd2776 100644
+--- a/docs/feature-support.md
++++ b/docs/feature-support.md
+@@ -206,7 +206,7 @@ lives in the [`googlesqlite` status](https://github.com/goccy/googlesqlite#statu
+ | Templated-argument functions | ✅ | |
+ | Query parameters (named and positional) | ✅ | Empty / absent numeric, temporal and string parameters are treated as typed `NULL`s. |
+ | Table-valued functions | ✅ | |
+-| `INFORMATION_SCHEMA` views | 🟡 | `googlesqlite` implements `SCHEMATA`, `TABLES`, `TABLE_OPTIONS` and `COLUMNS`; other views (e.g. `JOBS`, `VIEWS`, `ROUTINES`, `PARTITIONS`) are not implemented. |
++| `INFORMATION_SCHEMA` views | 🟡 | `googlesqlite` implements `SCHEMATA`, `TABLES`, `TABLE_OPTIONS` and `COLUMNS`. The emulator additionally implements the region-scoped job history view `[project.]region-<location>.INFORMATION_SCHEMA.JOBS` (and `JOBS_BY_PROJECT` / `JOBS_BY_USER` / `JOBS_BY_ORGANIZATION` aliases), derived from the same persisted job metadata as `jobs.list` / `jobs.get`; other views (e.g. `VIEWS`, `ROUTINES`, `PARTITIONS`) are not implemented. |
+ | Time travel (`FOR SYSTEM_TIME AS OF`) | ❌ | |
+ | Sessions / multi-statement transactions over the REST API | ❌ | |
+ | BigQuery ML statements (`CREATE MODEL`, `ML.*`) | ❌ | See [section 8](#8-bigquery-ml). |
+diff --git a/internal/contentdata/jobs_history.go b/internal/contentdata/jobs_history.go
+new file mode 100644
+index 0000000..f69160a
+--- /dev/null
++++ b/internal/contentdata/jobs_history.go
+@@ -0,0 +1,254 @@
++package contentdata
++
++import (
++	"regexp"
++	"strings"
++
++	"github.com/goccy/bigquery-emulator/internal/metadata"
++)
++
++// jobsHistoryTablePattern matches a region-qualified INFORMATION_SCHEMA.JOBS
++// table reference, the only form BigQuery exposes for job history:
++//
++//	`region-us`.INFORMATION_SCHEMA.JOBS
++//	`my-project.region-us`.INFORMATION_SCHEMA.JOBS
++//	`my-project`.`region-us`.INFORMATION_SCHEMA.JOBS
++//
++// The optional leading segment (project) is the explicit project
++// qualifier; the mandatory following segment is the region qualifier
++// (`region-<location>`). The JOBS_BY_PROJECT / JOBS_BY_USER /
++// JOBS_BY_ORGANIZATION / JOBS_BY_FOLDER variants are accepted as
++// aliases: the emulator has no multi-project / multi-user audit
++// surface, so every variant resolves to the same project-filtered
++// rows.
++//
++// The expression only carries ASCII patterns; it is applied to a
++// masked copy of the query in which string literals and comments are
++// blanked out, so a SQL text that merely mentions INFORMATION_SCHEMA.JOBS
++// inside a literal is left untouched.
++var jobsHistoryTablePattern = regexp.MustCompile(
++	`(?is)(?:(?P<project>` + "`(?:[^`]|``)*`" + `|[A-Za-z_][A-Za-z0-9_]*)` +
++		`\s*\.\s*)?` +
++		`(?P<region>` + "`(?:[^`]|``)*`" + `|[A-Za-z_][A-Za-z0-9_]*)` +
++		`\s*\.\s*INFORMATION_SCHEMA\s*\.\s*JOBS(?:_BY_(?:PROJECT|USER|ORGANIZATION|FOLDER))?\b`,
++)
++
++// RewriteJobsHistoryQuery routes region-qualified INFORMATION_SCHEMA.JOBS
++// references to the metadata-backed job history view. The user's WHERE /
++// ORDER BY / LIMIT clauses are left in place and apply, unchanged, to the
++// injected projection, so filtering and sorting behave exactly like
++// BigQuery's view.
++//
++// currentProjectID is the project the job belongs to: it is used as the
++// filter for the unqualified region form (`region-x`.INFORMATION_SCHEMA.JOBS),
++// matching BigQuery, where that form reports the running project's jobs.
++// An explicit project qualifier filters by that project instead.
++//
++// Dataset-scoped lookups (e.g. `my_dataset.INFORMATION_SCHEMA.JOBS`) are
++// left unmodified: BigQuery does not provide a dataset-scoped jobs view,
++// so the analyzer reports "table not found" just as it did before.
++func RewriteJobsHistoryQuery(query, currentProjectID string) string {
++	return rewriteJobsHistoryQuery(query, currentProjectID)
++}
++
++func rewriteJobsHistoryQuery(query, currentProjectID string) string {
++	if !strings.Contains(strings.ToUpper(query), "INFORMATION_SCHEMA") {
++		return query
++	}
++	masked := maskQueryLiterals(query)
++	matches := jobsHistoryTablePattern.FindAllStringSubmatchIndex(masked, -1)
++	if len(matches) == 0 {
++		return query
++	}
++
++	var b strings.Builder
++	last := 0
++	for _, m := range matches {
++		fullStart, fullEnd := m[0], m[1]
++		// Reject anything that looks like a longer qualified name than the
++		// documented [project.]region.INFORMATION_SCHEMA.JOBS path (e.g. an
++		// extra leading `catalog.` segment). A quoted opener (`) delimits
++		// tokens on its own, so a keyword glued to it (e.g. `FROM\`..\``)
++		// is still a genuine reference.
++		if fullStart > 0 {
++			prev := rune(query[fullStart-1])
++			if prev == '.' {
++				continue
++			}
++			if query[fullStart] != '`' && isIdentRune(prev) {
++				continue
++			}
++		}
++		projectRaw := segmentFromMatch(query, m, jobsHistoryTablePattern.SubexpIndex("project"))
++		regionRaw := segmentFromMatch(query, m, jobsHistoryTablePattern.SubexpIndex("region"))
++
++		region, explicitProject := splitRegionQualifier(projectRaw, regionRaw)
++		// Only rewrite genuine region qualifiers (`region-<location>`);
++		// anything else (e.g. a dataset name) keeps its original,
++		// analyzable form.
++		if !strings.HasPrefix(strings.ToLower(region), "region") {
++			continue
++		}
++		projectID := currentProjectID
++		if explicitProject != "" {
++			projectID = explicitProject
++		}
++
++		b.WriteString(query[last:fullStart])
++		b.WriteString("(SELECT * FROM ")
++		b.WriteString(metadata.JobsHistoryViewName)
++		b.WriteString(" WHERE project_id = '")
++		b.WriteString(escapeStringLiteral(projectID))
++		b.WriteString("')")
++		last = fullEnd
++	}
++	if last == 0 {
++		return query
++	}
++	b.WriteString(query[last:])
++	return b.String()
++}
++
++func segmentFromMatch(query string, match []int, groupIndex int) string {
++	if groupIndex < 0 {
++		return ""
++	}
++	start, end := match[2*groupIndex], match[2*groupIndex+1]
++	if start < 0 || end < 0 {
++		return ""
++	}
++	return unquoteIdentifier(query[start:end])
++}
++
++// splitRegionQualifier turns the (unquoted) project and region match
++// groups into a (region, explicitProject) pair. A single backticked
++// segment can carry both parts, `project.region-us`, mirroring the
++// dotted-identifier splitting the SQL engine itself performs.
++func splitRegionQualifier(projectRaw, regionRaw string) (region, project string) {
++	regionParts := strings.Split(regionRaw, ".")
++	region = regionParts[len(regionParts)-1]
++	if projectRaw != "" {
++		projectParts := strings.Split(projectRaw, ".")
++		project = projectParts[0]
++		return
++	}
++	if len(regionParts) > 1 {
++		project = regionParts[0]
++	}
++	return
++}
++
++func unquoteIdentifier(seg string) string {
++	seg = strings.TrimSpace(seg)
++	if len(seg) >= 2 && seg[0] == '`' && seg[len(seg)-1] == '`' {
++		seg = seg[1 : len(seg)-1]
++		seg = strings.ReplaceAll(seg, "``", "`")
++	}
++	return seg
++}
++
++func escapeStringLiteral(s string) string {
++	return strings.ReplaceAll(s, "'", "''")
++}
++
++func isIdentRune(r rune) bool {
++	return r == '_' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
++}
++
++// maskQueryLiterals returns a copy of query with the contents of string
++// literals and comments replaced by spaces, while backtick-quoted
++// identifiers are left intact (they are part of table references and may
++// contain dots, e.g. `project.region-us`). Newlines are preserved so
++// parser error offsets keep lining up.
++func maskQueryLiterals(query string) string {
++	out := make([]byte, len(query))
++	for i := 0; i < len(query); i++ {
++		c := query[i]
++		switch {
++		case c == '`':
++			out[i] = '`'
++			i++
++			for i < len(query) {
++				if query[i] == '`' {
++					if i+1 < len(query) && query[i+1] == '`' {
++						out[i] = '`'
++						out[i+1] = '`'
++						i += 2
++						continue
++					}
++					out[i] = '`'
++					break
++				}
++				out[i] = query[i]
++				i++
++			}
++		case c == '\'' || c == '"':
++			// Triple-quoted strings ('''...''' / """...""") if present.
++			if i+2 < len(query) && query[i+1] == c && query[i+2] == c {
++				out[i], out[i+1], out[i+2] = ' ', ' ', ' '
++				i += 3
++				for i < len(query) {
++					if i+2 < len(query) && query[i] == c && query[i+1] == c && query[i+2] == c {
++						out[i], out[i+1], out[i+2] = ' ', ' ', ' '
++						i += 2
++						break
++					}
++					if query[i] == '\n' {
++						out[i] = '\n'
++					} else {
++						out[i] = ' '
++					}
++					i++
++				}
++				continue
++			}
++			quote := c
++			out[i] = ' '
++			i++
++			for i < len(query) {
++				if query[i] == quote {
++					if i+1 < len(query) && query[i+1] == quote {
++						out[i], out[i+1] = ' ', ' '
++						i += 2
++						continue
++					}
++					out[i] = ' '
++					break
++				}
++				if query[i] == '\n' {
++					out[i] = '\n'
++				} else {
++					out[i] = ' '
++				}
++				i++
++			}
++		case c == '-' && i+1 < len(query) && query[i+1] == '-':
++			for i < len(query) && query[i] != '\n' {
++				out[i] = ' '
++				i++
++			}
++			if i < len(query) {
++				out[i] = '\n'
++			}
++		case c == '/' && i+1 < len(query) && query[i+1] == '*':
++			out[i], out[i+1] = ' ', ' '
++			i += 2
++			for i < len(query) {
++				if query[i] == '*' && i+1 < len(query) && query[i+1] == '/' {
++					out[i], out[i+1] = ' ', ' '
++					i++
++					break
++				}
++				if query[i] == '\n' {
++					out[i] = '\n'
++				} else {
++					out[i] = ' '
++				}
++				i++
++			}
++		default:
++			out[i] = c
++		}
++	}
++	return string(out)
++}
+diff --git a/internal/contentdata/jobs_history_test.go b/internal/contentdata/jobs_history_test.go
+new file mode 100644
+index 0000000..bad19d7
+--- /dev/null
++++ b/internal/contentdata/jobs_history_test.go
+@@ -0,0 +1,142 @@
++package contentdata
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/goccy/bigquery-emulator/internal/metadata"
++)
++
++func TestRewriteJobsHistoryQuery(t *testing.T) {
++	const view = metadata.JobsHistoryViewName
++	contains := func(t *testing.T, got, want string) {
++		t.Helper()
++		if !strings.Contains(got, want) {
++			t.Errorf("rewritten query = %q, want substring %q", got, want)
++		}
++	}
++	notContains := func(t *testing.T, got, want string) {
++		t.Helper()
++		if strings.Contains(got, want) {
++			t.Errorf("rewritten query = %q, must not contain %q", got, want)
++		}
++	}
++
++	t.Run("region qualified current project", func(t *testing.T) {
++		got := rewriteJobsHistoryQuery(
++			"SELECT job_id FROM `region-us`.INFORMATION_SCHEMA.JOBS WHERE state = 'DONE'",
++			"proj",
++		)
++		notContains(t, got, "`region-us`")
++		contains(t, got, "(SELECT * FROM "+view+" WHERE project_id = 'proj')")
++		// user clauses stay intact
++		contains(t, got, "WHERE state = 'DONE'")
++	})
++
++	t.Run("project and region qualified", func(t *testing.T) {
++		got := rewriteJobsHistoryQuery(
++			"SELECT job_id FROM `other.region-asia-northeast1`.INFORMATION_SCHEMA.JOBS",
++			"proj",
++		)
++		contains(t, got, "project_id = 'other'")
++	})
++
++	t.Run("separately quoted project and region", func(t *testing.T) {
++		got := rewriteJobsHistoryQuery(
++			"SELECT job_id FROM `other`.`region-eu`.INFORMATION_SCHEMA.JOBS",
++			"proj",
++		)
++		contains(t, got, "project_id = 'other'")
++	})
++
++	t.Run("JOBS_BY_PROJECT variant", func(t *testing.T) {
++		got := rewriteJobsHistoryQuery(
++			"SELECT job_id FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT",
++			"proj",
++		)
++		contains(t, got, view)
++		contains(t, got, "project_id = 'proj'")
++	})
++
++	t.Run("case insensitive", func(t *testing.T) {
++		got := rewriteJobsHistoryQuery(
++			"select job_id from `REGION-US`.information_schema.jobs",
++			"proj",
++		)
++		contains(t, got, view)
++	})
++
++	t.Run("dataset scoped JOBS is not rewritten", func(t *testing.T) {
++		src := "SELECT job_id FROM my_dataset.INFORMATION_SCHEMA.JOBS"
++		got := rewriteJobsHistoryQuery(src, "proj")
++		if got != src {
++			t.Errorf("dataset-scoped JOBS must not be rewritten: %q", got)
++		}
++	})
++
++	t.Run("other INFORMATION_SCHEMA views untouched", func(t *testing.T) {
++		src := "SELECT column_name FROM ds.INFORMATION_SCHEMA.COLUMNS WHERE table_name='x'"
++		got := rewriteJobsHistoryQuery(src, "proj")
++		if got != src {
++			t.Errorf("non-JOBS INFORMATION_SCHEMA queries must not be rewritten: %q", got)
++		}
++	})
++
++	t.Run("mention inside string literal untouched", func(t *testing.T) {
++		src := "SELECT '`region-us`.INFORMATION_SCHEMA.JOBS' AS s"
++		got := rewriteJobsHistoryQuery(src, "proj")
++		if got != src {
++			t.Errorf("string literal content must be left untouched: %q", got)
++		}
++	})
++
++	t.Run("mention inside line comment untouched", func(t *testing.T) {
++		src := "SELECT 1 -- `region-us`.INFORMATION_SCHEMA.JOBS\n"
++		got := rewriteJobsHistoryQuery(src, "proj")
++		if got != src {
++			t.Errorf("comment content must be left untouched: %q", got)
++		}
++	})
++
++	t.Run("multiple references each filtered", func(t *testing.T) {
++		got := rewriteJobsHistoryQuery(
++			"SELECT * FROM `region-us`.INFORMATION_SCHEMA.JOBS a JOIN `other.region-us`.INFORMATION_SCHEMA.JOBS b ON a.job_id = b.job_id",
++			"proj",
++		)
++		if strings.Count(got, view) != 2 {
++			t.Errorf("want 2 view references, got %q", got)
++		}
++		contains(t, got, "project_id = 'proj'")
++		contains(t, got, "project_id = 'other'")
++	})
++
++	t.Run("backtick glued to keyword", func(t *testing.T) {
++		got := rewriteJobsHistoryQuery(
++			"SELECT job_id FROM`region-us`.INFORMATION_SCHEMA.JOBS",
++			"proj",
++		)
++		contains(t, got, view)
++	})
++
++	t.Run("single quote in project id escaped", func(t *testing.T) {
++		got := rewriteJobsHistoryQuery(
++			"SELECT 1 FROM `region-us`.INFORMATION_SCHEMA.JOBS",
++			"pro'ject",
++		)
++		contains(t, got, "project_id = 'pro''ject'")
++	})
++}
++
++func TestMaskQueryLiterals(t *testing.T) {
++	// backtick identifiers must survive masking (dots included)
++	masked := maskQueryLiterals("SELECT 'x' AS s, `p.region-us`.INFORMATION_SCHEMA.JOBS -- c\n")
++	if !strings.Contains(masked, "`p.region-us`.INFORMATION_SCHEMA.JOBS") {
++		t.Errorf("backtick identifiers must survive masking: %q", masked)
++	}
++	if strings.Contains(masked, "'x'") {
++		t.Errorf("string literal should be masked: %q", masked)
++	}
++	if strings.Contains(masked, "-- c") {
++		t.Errorf("line comment should be masked: %q", masked)
++	}
++}
+diff --git a/internal/contentdata/repository.go b/internal/contentdata/repository.go
+index 9458739..98f18f7 100644
+--- a/internal/contentdata/repository.go
++++ b/internal/contentdata/repository.go
+@@ -184,6 +184,10 @@ func (r *Repository) Query(ctx context.Context, tx *connection.Tx, projectID, da
+ 	if err := tx.ContentRepoMode(); err != nil {
+ 		return nil, err
+ 	}
++	// Route region-qualified INFORMATION_SCHEMA.JOBS references to the
++	// metadata-backed job history view before the query reaches the
++	// analyzer, which would otherwise report "Table not found".
++	query = rewriteJobsHistoryQuery(query, projectID)
+ 	defer func() {
+ 		_ = tx.MetadataRepoMode()
+ 	}()
+diff --git a/internal/metadata/job.go b/internal/metadata/job.go
+index 2e88c0c..e951f93 100644
+--- a/internal/metadata/job.go
++++ b/internal/metadata/job.go
+@@ -65,8 +65,33 @@ func (j *Job) Wait(ctx context.Context) (*internaltypes.QueryResponse, error) {
+ 	}
+ }
+ 
+-func (j *Job) Cancel(ctx context.Context) error {
+-	// TODO: job needs to be able to rollback
++// Cancel records that the job was cancelled. The emulator runs jobs
++// synchronously, so a cancel request always arrives after the job has
++// reached a terminal state; we mirror BigQuery by stamping the job with
++// a DONE status carrying a "stopped" error result, and persist it in the
++// same transaction as the surrounding REST call. A job that already
++// failed keeps its original error result. The already-produced query
++// response is deliberately left intact so getQueryResults stays
++// compatible.
++func (j *Job) Cancel(ctx context.Context, tx *sql.Tx) error {
++	j.mu.Lock()
++	defer j.mu.Unlock()
++	if j.content == nil {
++		j.content = &bigqueryv2.Job{}
++	}
++	if j.content.Status == nil {
++		j.content.Status = &bigqueryv2.JobStatus{}
++	}
++	if j.content.Status.ErrorResult == nil {
++		j.content.Status.State = "DONE"
++		j.content.Status.ErrorResult = &bigqueryv2.ErrorProto{
++			Reason:  "stopped",
++			Message: "Job execution was cancelled",
++		}
++	}
++	if err := j.repo.UpdateJob(ctx, tx, j); err != nil {
++		return fmt.Errorf("failed to update job: %w", err)
++	}
+ 	return nil
+ }
+ 
+diff --git a/internal/metadata/jobs_view.go b/internal/metadata/jobs_view.go
+new file mode 100644
+index 0000000..4628f4e
+--- /dev/null
++++ b/internal/metadata/jobs_view.go
+@@ -0,0 +1,81 @@
++package metadata
++
++// JobsHistoryViewName is the storage name of the view that exposes job
++// history in the BigQuery INFORMATION_SCHEMA.JOBS shape.
++//
++// The view lives in the metadata namespace (an unqualified, root-level
++// catalog object, like the `jobs` table itself). User queries never
++// reference it directly: the content layer rewrites region-qualified
++// `INFORMATION_SCHEMA.JOBS` references into a projection over it.
++// Being root-level keeps it invisible to INFORMATION_SCHEMA.SCHEMATA /
++// TABLES / COLUMNS, whose synthesizers skip single-segment name paths.
++const JobsHistoryViewName = "bq_emulator_information_schema_jobs"
++
++// jobsHistoryViewDDL derives the INFORMATION_SCHEMA.JOBS compatible
++// view from the metadata `jobs` table — the very same rows that back
++// jobs.get / jobs.list. Because the view is computed live from that
++// table, history rows can never duplicate or drift from the REST
++// metadata: job insertion, failure, cancellation and deletion all
++// mutate `jobs` inside one transaction, and both surfaces read it.
++//
++// Column names and types mirror BigQuery's region-scoped
++// INFORMATION_SCHEMA.JOBS view. Fields the emulator does not track
++// (parent_job_id, reservation, referenced_tables contents) are
++// emitted as NULL / empty typed values so every row has the full
++// column set.
++var jobsHistoryViewDDL = `
++CREATE VIEW IF NOT EXISTS ` + JobsHistoryViewName + ` AS
++SELECT
++  TIMESTAMP_SECONDS(CAST(JSON_VALUE(metadata, '$.statistics.creationTime') AS INT64)) AS creation_time,
++  TIMESTAMP_SECONDS(CAST(JSON_VALUE(metadata, '$.statistics.startTime') AS INT64)) AS start_time,
++  TIMESTAMP_SECONDS(CAST(JSON_VALUE(metadata, '$.statistics.endTime') AS INT64)) AS end_time,
++  id AS job_id,
++  projectID AS project_id,
++  IFNULL(JSON_VALUE(metadata, '$.configuration.jobType'), 'QUERY') AS job_type,
++  IFNULL(JSON_VALUE(metadata, '$.status.state'), 'DONE') AS state,
++  IF(
++    JSON_VALUE(metadata, '$.status.errorResult.reason') IS NULL
++      AND JSON_VALUE(metadata, '$.status.errorResult.message') IS NULL,
++    CAST(NULL AS STRUCT<reason STRING, location STRING, message STRING>),
++    STRUCT(
++      JSON_VALUE(metadata, '$.status.errorResult.reason') AS reason,
++      JSON_VALUE(metadata, '$.status.errorResult.location') AS location,
++      JSON_VALUE(metadata, '$.status.errorResult.message') AS message
++    )
++  ) AS error_result,
++  JSON_VALUE(metadata, '$.configuration.query.query') AS query,
++  IF(
++    COALESCE(
++      JSON_VALUE(metadata, '$.configuration.query.destinationTable.tableId'),
++      JSON_VALUE(metadata, '$.configuration.load.destinationTable.tableId')
++    ) IS NULL,
++    CAST(NULL AS STRUCT<project_id STRING, dataset_id STRING, table_id STRING>),
++    STRUCT(
++      COALESCE(
++        JSON_VALUE(metadata, '$.configuration.query.destinationTable.projectId'),
++        JSON_VALUE(metadata, '$.configuration.load.destinationTable.projectId')
++      ) AS project_id,
++      COALESCE(
++        JSON_VALUE(metadata, '$.configuration.query.destinationTable.datasetId'),
++        JSON_VALUE(metadata, '$.configuration.load.destinationTable.datasetId')
++      ) AS dataset_id,
++      COALESCE(
++        JSON_VALUE(metadata, '$.configuration.query.destinationTable.tableId'),
++        JSON_VALUE(metadata, '$.configuration.load.destinationTable.tableId')
++      ) AS table_id
++    )
++  ) AS destination_table,
++  CAST(
++    ARRAY<STRUCT<project_id STRING, dataset_id STRING, table_id STRING>>[]
++    AS ARRAY<STRUCT<project_id STRING, dataset_id STRING, table_id STRING>>
++  ) AS referenced_tables,
++  IFNULL(CAST(JSON_VALUE(metadata, '$.statistics.totalBytesProcessed') AS INT64), 0) AS total_bytes_processed,
++  IFNULL(CAST(JSON_VALUE(metadata, '$.statistics.query.totalBytesBilled') AS INT64), 0) AS total_bytes_billed,
++  IFNULL(CAST(JSON_VALUE(metadata, '$.statistics.query.cacheHit') AS BOOL), FALSE) AS cache_hit,
++  JSON_VALUE(metadata, '$.configuration.query.priority') AS priority,
++  JSON_VALUE(metadata, '$.statistics.query.statementType') AS statement_type,
++  JSON_VALUE(metadata, '$.userEmail') AS user_email,
++  CAST(NULL AS STRING) AS parent_job_id,
++  CAST(NULL AS STRING) AS reservation
++FROM jobs
++`
+diff --git a/internal/metadata/repository.go b/internal/metadata/repository.go
+index 6ffaa18..cb29d54 100644
+--- a/internal/metadata/repository.go
++++ b/internal/metadata/repository.go
+@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS jobs (
+   error     STRING,
+   PRIMARY KEY (projectID, id)
+ )`,
++	// The INFORMATION_SCHEMA.JOBS compatible view derives job history
++	// from the jobs table above, so it must be created after it.
++	jobsHistoryViewDDL,
+ 	`
+ CREATE TABLE IF NOT EXISTS datasets (
+   id         STRING NOT NULL,
+diff --git a/server/handler.go b/server/handler.go
+index 32a2c7d..964e52d 100644
+--- a/server/handler.go
++++ b/server/handler.go
+@@ -1125,7 +1125,22 @@ type jobsCancelRequest struct {
+ }
+ 
+ func (h *jobsCancelHandler) Handle(ctx context.Context, r *jobsCancelRequest) (*bigqueryv2.JobCancelResponse, error) {
+-	if err := r.job.Cancel(ctx); err != nil {
++	conn, err := r.server.connMgr.Connection(ctx, r.project.ID, "")
++	if err != nil {
++		return nil, fmt.Errorf("failed to get connection: %w", err)
++	}
++	tx, err := conn.Begin(ctx)
++	if err != nil {
++		return nil, fmt.Errorf("failed to start transaction: %w", err)
++	}
++	defer tx.RollbackIfNotCommitted()
++	// Persist the cancelled status in the same metadata store that
++	// jobs.get / jobs.list and INFORMATION_SCHEMA.JOBS read, so the
++	// cancel is visible from every surface.
++	if err := r.job.Cancel(ctx, tx.Tx()); err != nil {
++		return nil, err
++	}
++	if err := tx.Commit(); err != nil {
+ 		return nil, err
+ 	}
+ 	return &bigqueryv2.JobCancelResponse{Job: r.job.Content()}, nil
+@@ -1751,12 +1766,16 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
+ 	defer tx.RollbackIfNotCommitted()
+ 	hasDestinationTable := job.Configuration.Query.DestinationTable != nil
+ 	startTime := time.Now()
++	// Route region-qualified INFORMATION_SCHEMA.JOBS references to the
++	// metadata-backed history view before analysis. The recorded job
++	// configuration keeps the original query text.
++	historyRewrittenQuery := contentdata.RewriteJobsHistoryQuery(job.Configuration.Query.Query, r.project.ID)
+ 	response, jobErr := r.server.contentRepo.Query(
+ 		ctx,
+ 		tx,
+ 		queryProjectID,
+ 		datasetID,
+-		job.Configuration.Query.Query,
++		historyRewrittenQuery,
+ 		job.Configuration.Query.QueryParameters,
+ 	)
+ 	endTime := time.Now()
+@@ -2132,17 +2151,18 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
+ 	}
+ 	defer tx.RollbackIfNotCommitted()
+ 	startTime := time.Now()
++	// Rewrite region-qualified INFORMATION_SCHEMA.JOBS references to the
++	// metadata-backed history view before analysis. The job's project (the
++	// API project) is the unqualified-region scope, matching BigQuery.
++	historyRewrittenQuery := contentdata.RewriteJobsHistoryQuery(r.queryRequest.Query, r.project.ID)
+ 	response, queryErr := r.server.contentRepo.Query(
+ 		ctx,
+ 		tx,
+ 		queryProjectID,
+ 		datasetID,
+-		r.queryRequest.Query,
++		historyRewrittenQuery,
+ 		r.queryRequest.QueryParameters,
+ 	)
+-	if queryErr != nil {
+-		return nil, queryErr
+-	}
+ 	endTime := time.Now()
+ 	// jobs.query allocates jobIDs server-side (real BigQuery does the
+ 	// same). queryRequest.RequestId is the *idempotency* key — same
+@@ -2166,10 +2186,21 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
+ 	// synthetic Job below carries the minimum fields the GET handler
+ 	// returns to the caller; DryRun queries skip both the AddJob and the
+ 	// Commit so they remain side-effect-free.
++	//
++	// The job is recorded even when the query failed: real BigQuery keeps
++	// the failed job (visible in INFORMATION_SCHEMA.JOBS with state DONE
++	// and an error_result), so the failure path commits the row before
++	// returning the error, keeping job history complete.
+ 	var totalBytes int64
+ 	if response != nil {
+ 		totalBytes = response.TotalBytes
+ 	}
++	status := &bigqueryv2.JobStatus{State: "DONE"}
++	if queryErr != nil {
++		internalErr := errJobInternalError(queryErr.Error())
++		status.ErrorResult = internalErr.ErrorProto()
++		status.Errors = []*bigqueryv2.ErrorProto{internalErr.ErrorProto()}
++	}
+ 	job := &bigqueryv2.Job{
+ 		Kind: "bigquery#job",
+ 		JobReference: &bigqueryv2.JobReference{
+@@ -2187,7 +2218,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
+ 				Priority:        "INTERACTIVE",
+ 			},
+ 		},
+-		Status: &bigqueryv2.JobStatus{State: "DONE"},
++		Status: status,
+ 		Statistics: &bigqueryv2.JobStatistics{
+ 			Query: &bigqueryv2.JobStatistics2{
+ 				CacheHit:            false,
+@@ -2217,7 +2248,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
+ 				jobID,
+ 				job,
+ 				response,
+-				nil,
++				queryErr,
+ 			),
+ 		); err != nil {
+ 			return nil, fmt.Errorf("failed to add job: %w", err)
+@@ -2225,12 +2256,15 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
+ 		if err := tx.Commit(); err != nil {
+ 			return nil, err
+ 		}
+-		if response.ChangedCatalog.Changed() {
++		if response != nil && response.ChangedCatalog.Changed() {
+ 			if err := syncCatalog(ctx, r.server, response.ChangedCatalog); err != nil {
+ 				return nil, err
+ 			}
+ 		}
+ 	}
++	if queryErr != nil {
++		return nil, queryErr
++	}
+ 	response.Rows = internaltypes.Format(response.Schema, response.Rows, r.useInt64Timestamp)
+ 	response.JobReference = job.JobReference
+ 	return response, nil
+diff --git a/server/jobs_history_test.go b/server/jobs_history_test.go
+new file mode 100644
+index 0000000..a3ff36d
+--- /dev/null
++++ b/server/jobs_history_test.go
+@@ -0,0 +1,395 @@
++package server_test
++
++import (
++	"bytes"
++	"context"
++	"net/http"
++	"testing"
++	"time"
++
++	"cloud.google.com/go/bigquery"
++	"github.com/goccy/bigquery-emulator/server"
++	"github.com/goccy/bigquery-emulator/types"
++	"google.golang.org/api/iterator"
++	"google.golang.org/api/option"
++)
++
++// runQueryRows runs q through the jobs.query path and returns every row.
++func runQueryRows(t *testing.T, ctx context.Context, client *bigquery.Client, q string) [][]bigquery.Value {
++	t.Helper()
++	it, err := client.Query(q).Read(ctx)
++	if err != nil {
++		t.Fatalf("submit %q: %v", q, err)
++	}
++	var rows [][]bigquery.Value
++	for {
++		var row []bigquery.Value
++		err := it.Next(&row)
++		if err == iterator.Done {
++			break
++		}
++		if err != nil {
++			t.Fatalf("iterate %q: %v", q, err)
++		}
++		rows = append(rows, row)
++	}
++	return rows
++}
++
++// listJobIDs returns the set of job ids visible through jobs.list.
++func listJobIDs(t *testing.T, ctx context.Context, client *bigquery.Client) map[string]bool {
++	t.Helper()
++	ids := map[string]bool{}
++	it := client.Jobs(ctx)
++	for {
++		j, err := it.Next()
++		if err == iterator.Done {
++			break
++		}
++		if err != nil {
++			t.Fatalf("jobs.list: %v", err)
++		}
++		ids[j.ID()] = true
++	}
++	return ids
++}
++
++// TestJobsInformationSchema covers the BigQuery-compatible
++// INFORMATION_SCHEMA.JOBS region-scoped job history view: the region and
++// project+region qualification forms, filtering and sorting, failed /
++// cancelled / deleted jobs, and compatibility of the existing surfaces.
++func TestJobsInformationSchema(t *testing.T) {
++	ctx := context.Background()
++
++	bqServer, err := server.New(server.TempStorage)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := bqServer.Load(server.StructSource(types.NewProject("test", types.NewDataset("ds")))); err != nil {
++		t.Fatal(err)
++	}
++	testServer := bqServer.TestServer()
++	defer func() {
++		testServer.Close()
++		bqServer.Stop(ctx)
++	}()
++
++	client, err := bigquery.NewClient(ctx, "test",
++		option.WithEndpoint(testServer.URL),
++		option.WithoutAuthentication(),
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer client.Close()
++
++	// Produce history: a DDL job, a DML job, a FAILED jobs.query and a
++	// successful query with a materialized result set.
++	runQueryRows(t, ctx, client, "CREATE TABLE ds.t (x INT64)")
++	runQueryRows(t, ctx, client, "INSERT ds.t VALUES (1),(2)")
++	if _, err := client.Query("SELECT * FROM ds.t WHERE x = no_such_column").Read(ctx); err == nil {
++		t.Fatal("expected the invalid query to fail")
++	}
++	if _, err := client.Query("SELECT 1 AS one").Run(ctx); err != nil {
++		t.Fatal(err)
++	}
++
++	t.Run("region scoped rows", func(t *testing.T) {
++		rows := runQueryRows(t, ctx, client,
++			"SELECT job_id, job_type, state FROM `region-us`.INFORMATION_SCHEMA.JOBS ORDER BY creation_time")
++		// The four setup jobs; the history query itself is not yet
++		// committed while the view is scanned.
++		if len(rows) != 4 {
++			t.Fatalf("want 4 history rows, got %d: %v", len(rows), rows)
++		}
++		for _, r := range rows {
++			if r[1] != "QUERY" {
++				t.Errorf("job_type = %v, want QUERY", r[1])
++			}
++			if r[2] != "DONE" {
++				t.Errorf("state = %v, want DONE", r[2])
++			}
++		}
++	})
++
++	t.Run("project and region qualified", func(t *testing.T) {
++		rows := runQueryRows(t, ctx, client,
++			"SELECT job_id FROM `test.region-us`.INFORMATION_SCHEMA.JOBS")
++		if len(rows) < 4 {
++			t.Fatalf("want >=4 rows, got %d", len(rows))
++		}
++	})
++
++	t.Run("separately quoted project and region", func(t *testing.T) {
++		rows := runQueryRows(t, ctx, client,
++			"SELECT job_id FROM `test`.`region-us`.INFORMATION_SCHEMA.JOBS")
++		if len(rows) < 4 {
++			t.Fatalf("want >=4 rows, got %d", len(rows))
++		}
++	})
++
++	t.Run("JOBS_BY_PROJECT alias", func(t *testing.T) {
++		rows := runQueryRows(t, ctx, client,
++			"SELECT job_id FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT")
++		if len(rows) < 4 {
++			t.Fatalf("want >=4 rows, got %d", len(rows))
++		}
++	})
++
++	t.Run("times and timestamps", func(t *testing.T) {
++		rows := runQueryRows(t, ctx, client,
++			"SELECT creation_time, start_time, end_time FROM `region-us`.INFORMATION_SCHEMA.JOBS LIMIT 1")
++		if len(rows) != 1 {
++			t.Fatalf("want 1 row, got %d", len(rows))
++		}
++		for _, v := range rows[0][:3] {
++			if _, ok := v.(time.Time); !ok {
++				t.Errorf("timestamp column = %T, want time.Time", v)
++			}
++		}
++	})
++
++	t.Run("failed job exposes error_result", func(t *testing.T) {
++		rows := runQueryRows(t, ctx, client,
++			"SELECT error_result.reason, error_result.message FROM `region-us`.INFORMATION_SCHEMA.JOBS "+
++				"WHERE error_result IS NOT NULL")
++		if len(rows) != 1 {
++			t.Fatalf("want exactly 1 failed job row, got %d: %v", len(rows), rows)
++		}
++		if rows[0][0] != "jobInternalError" {
++			t.Errorf("error_result.reason = %v, want jobInternalError", rows[0][0])
++		}
++		if rows[0][1] == "" {
++			t.Error("error_result.message is empty")
++		}
++	})
++
++	t.Run("filter and sort by query text", func(t *testing.T) {
++		rows := runQueryRows(t, ctx, client,
++			"SELECT job_id FROM `region-us`.INFORMATION_SCHEMA.JOBS "+
++				"WHERE query LIKE '%CREATE TABLE%' ORDER BY start_time DESC LIMIT 1")
++		if len(rows) != 1 {
++			t.Fatalf("want 1 row, got %d", len(rows))
++		}
++	})
++
++	t.Run("destination table for result jobs", func(t *testing.T) {
++		rows := runQueryRows(t, ctx, client,
++			"SELECT destination_table.dataset_id, destination_table.table_id "+
++				"FROM `region-us`.INFORMATION_SCHEMA.JOBS "+
++				"WHERE destination_table IS NOT NULL AND query = 'SELECT 1 AS one'")
++		if len(rows) != 1 {
++			t.Fatalf("want 1 destination row, got %d", len(rows))
++		}
++		// A SELECT without explicit destination is materialized into the
++		// anonymous results dataset named after the job id.
++		if rows[0][0] != rows[0][1] {
++			t.Errorf("anonymous destination dataset/table mismatch: %v", rows[0])
++		}
++	})
++
++	t.Run("cancelled job is marked stopped", func(t *testing.T) {
++		job, err := client.Query("SELECT 42").Run(ctx)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if _, err := job.Wait(ctx); err != nil {
++			t.Fatal(err)
++		}
++		if err := job.Cancel(ctx); err != nil {
++			t.Fatal(err)
++		}
++		rows := runQueryRows(t, ctx, client,
++			"SELECT error_result.reason FROM `region-us`.INFORMATION_SCHEMA.JOBS "+
++				"WHERE job_id = '"+job.ID()+"'")
++		if len(rows) != 1 || rows[0][0] != "stopped" {
++			t.Fatalf("cancel not reflected in history: %v", rows)
++		}
++	})
++
++	t.Run("deleted job disappears from history", func(t *testing.T) {
++		job, err := client.Query("SELECT 43").Run(ctx)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if _, err := job.Wait(ctx); err != nil {
++			t.Fatal(err)
++		}
++		if err := job.Delete(ctx); err != nil {
++			t.Fatal(err)
++		}
++		rows := runQueryRows(t, ctx, client,
++			"SELECT COUNT(*) AS c FROM `region-us`.INFORMATION_SCHEMA.JOBS "+
++				"WHERE job_id = '"+job.ID()+"'")
++		if len(rows) != 1 || rows[0][0].(int64) != 0 {
++			t.Fatalf("deleted job still visible in history: %v", rows)
++		}
++	})
++
++	t.Run("dry run creates no history row", func(t *testing.T) {
++		before := len(listJobIDs(t, ctx, client))
++		q := client.Query("SELECT job_id FROM `region-us`.INFORMATION_SCHEMA.JOBS")
++		q.QueryConfig.DryRun = true
++		// Dry runs are reported through jobs.insert synchronously and must
++		// not persist a job.
++		if _, err := q.Run(ctx); err != nil {
++			t.Fatal(err)
++		}
++		after := len(listJobIDs(t, ctx, client))
++		if after != before {
++			t.Fatalf("dry run changed jobs.list count: before=%d after=%d", before, after)
++		}
++	})
++
++	t.Run("dataset scoped jobs view stays invalid", func(t *testing.T) {
++		_, err := client.Query("SELECT job_id FROM ds.INFORMATION_SCHEMA.JOBS").Read(ctx)
++		if err == nil {
++			t.Fatal("dataset-scoped INFORMATION_SCHEMA.JOBS must not resolve")
++		}
++	})
++
++	t.Run("ordinary INFORMATION_SCHEMA still works", func(t *testing.T) {
++		rows := runQueryRows(t, ctx, client,
++			"SELECT column_name FROM ds.INFORMATION_SCHEMA.COLUMNS "+
++				"WHERE table_name = 't' ORDER BY ordinal_position")
++		if len(rows) != 1 || rows[0][0] != "x" {
++			t.Fatalf("INFORMATION_SCHEMA.COLUMNS broken: %v", rows)
++		}
++	})
++
++	t.Run("jobs.list stays consistent", func(t *testing.T) {
++		view := runQueryRows(t, ctx, client,
++			"SELECT job_id FROM `region-us`.INFORMATION_SCHEMA.JOBS")
++		list := listJobIDs(t, ctx, client)
++		// Every history row belongs to a job jobs.list can see. The view
++		// cannot see the row of the query that scans it (committed after
++		// the scan), so list may be one larger — never smaller.
++		if len(list) < len(view) {
++			t.Fatalf("jobs.list (%d) has fewer jobs than the history view (%d)", len(list), len(view))
++		}
++		for _, r := range view {
++			if !list[r[0].(string)] {
++				t.Errorf("history row %s missing from jobs.list", r[0])
++			}
++		}
++	})
++
++	t.Run("jobs.get and getQueryResults keep working", func(t *testing.T) {
++		job, err := client.Query("SELECT 7 AS seven").Run(ctx)
++		if err != nil {
++			t.Fatal(err)
++		}
++		status, err := job.Wait(ctx)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if err := status.Err(); err != nil {
++			t.Fatal(err)
++		}
++		got, err := client.JobFromID(ctx, job.ID())
++		if err != nil {
++			t.Fatalf("jobs.get: %v", err)
++		}
++		if got.ID() != job.ID() {
++			t.Fatalf("jobs.get id mismatch: %s vs %s", got.ID(), job.ID())
++		}
++		it, err := client.Query("SELECT 8 AS eight").Read(ctx)
++		if err != nil {
++			t.Fatal(err)
++		}
++		var row []bigquery.Value
++		if err := it.Next(&row); err != nil {
++			t.Fatalf("getQueryResults path: %v", err)
++		}
++	})
++
++	t.Run("raw REST query with region view", func(t *testing.T) {
++		body := []byte(`{"query":"SELECT job_id FROM ` + "`region-us`" + `.INFORMATION_SCHEMA.JOBS LIMIT 1","useLegacySql":false}`)
++		req, err := http.NewRequest(http.MethodPost, testServer.URL+"/projects/test/queries",
++			bytes.NewReader(body))
++		if err != nil {
++			t.Fatal(err)
++		}
++		res, err := http.DefaultClient.Do(req)
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer res.Body.Close()
++		if res.StatusCode != http.StatusOK {
++			t.Fatalf("rest jobs.query status = %d", res.StatusCode)
++		}
++	})
++}
++
++// TestJobsInformationSchemaRestart verifies that job history kept across
++// a process restart matches the REST metadata exactly: the view is
++// derived from the same persisted jobs table that backs jobs.list.
++func TestJobsInformationSchemaRestart(t *testing.T) {
++	ctx := context.Background()
++	dbFile := t.TempDir() + "/emulator.db"
++
++	start := func() (*server.Server, *server.TestServer, *bigquery.Client) {
++		bqServer, err := server.New(server.Storage("file:" + dbFile + "?cache=shared"))
++		if err != nil {
++			t.Fatal(err)
++		}
++		if err := bqServer.Load(server.StructSource(types.NewProject("test", types.NewDataset("ds")))); err != nil {
++			t.Fatal(err)
++		}
++		ts := bqServer.TestServer()
++		client, err := bigquery.NewClient(ctx, "test",
++			option.WithEndpoint(ts.URL),
++			option.WithoutAuthentication(),
++		)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return bqServer, ts, client
++	}
++
++	bqServer, ts, client := start()
++	runQueryRows(t, ctx, client, "CREATE TABLE ds.t (x INT64)")
++	runQueryRows(t, ctx, client, "INSERT ds.t VALUES (7)")
++	if _, err := client.Query("SELECT bad FROM ds.t").Read(ctx); err == nil {
++		t.Fatal("expected query failure")
++	}
++	beforeList := listJobIDs(t, ctx, client)
++	client.Close()
++	ts.Close()
++	if err := bqServer.Stop(ctx); err != nil {
++		t.Fatal(err)
++	}
++
++	bqServer2, ts2, client2 := start()
++	defer func() {
++		client2.Close()
++		ts2.Close()
++		bqServer2.Stop(ctx)
++	}()
++
++	// The first post-restart history scan sees exactly the jobs present
++	// before shutdown (its own job row is committed only afterwards).
++	rows := runQueryRows(t, ctx, client2,
++		"SELECT job_id FROM `region-us`.INFORMATION_SCHEMA.JOBS ORDER BY start_time")
++	if len(rows) != len(beforeList) {
++		t.Fatalf("history rows after restart = %d, jobs.list before restart = %d", len(rows), len(beforeList))
++	}
++	for _, r := range rows {
++		if !beforeList[r[0].(string)] {
++			t.Errorf("history row %s did not exist before restart", r[0])
++		}
++	}
++
++	// The failed job survived the restart with its error result.
++	errRows := runQueryRows(t, ctx, client2,
++		"SELECT error_result.reason FROM `region-us`.INFORMATION_SCHEMA.JOBS WHERE error_result IS NOT NULL")
++	if len(errRows) != 1 || errRows[0][0] != "jobInternalError" {
++		t.Fatalf("failed job not preserved across restart: %v", errRows)
++	}
++
++	// User data persisted as well.
++	data := runQueryRows(t, ctx, client2, "SELECT x FROM ds.t")
++	if len(data) != 1 || data[0][0] != int64(7) {
++		t.Fatalf("user data not readable after restart: %v", data)
++	}
++}

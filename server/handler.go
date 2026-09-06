@@ -1125,7 +1125,22 @@ type jobsCancelRequest struct {
 }
 
 func (h *jobsCancelHandler) Handle(ctx context.Context, r *jobsCancelRequest) (*bigqueryv2.JobCancelResponse, error) {
-	if err := r.job.Cancel(ctx); err != nil {
+	conn, err := r.server.connMgr.Connection(ctx, r.project.ID, "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get connection: %w", err)
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start transaction: %w", err)
+	}
+	defer tx.RollbackIfNotCommitted()
+	// Persist the cancelled status in the same metadata store that
+	// jobs.get / jobs.list and INFORMATION_SCHEMA.JOBS read, so the
+	// cancel is visible from every surface.
+	if err := r.job.Cancel(ctx, tx.Tx()); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return &bigqueryv2.JobCancelResponse{Job: r.job.Content()}, nil
@@ -1751,12 +1766,16 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 	defer tx.RollbackIfNotCommitted()
 	hasDestinationTable := job.Configuration.Query.DestinationTable != nil
 	startTime := time.Now()
+	// Route region-qualified INFORMATION_SCHEMA.JOBS references to the
+	// metadata-backed history view before analysis. The recorded job
+	// configuration keeps the original query text.
+	historyRewrittenQuery := contentdata.RewriteJobsHistoryQuery(job.Configuration.Query.Query, r.project.ID)
 	response, jobErr := r.server.contentRepo.Query(
 		ctx,
 		tx,
 		queryProjectID,
 		datasetID,
-		job.Configuration.Query.Query,
+		historyRewrittenQuery,
 		job.Configuration.Query.QueryParameters,
 	)
 	endTime := time.Now()
@@ -2132,17 +2151,18 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 	}
 	defer tx.RollbackIfNotCommitted()
 	startTime := time.Now()
+	// Rewrite region-qualified INFORMATION_SCHEMA.JOBS references to the
+	// metadata-backed history view before analysis. The job's project (the
+	// API project) is the unqualified-region scope, matching BigQuery.
+	historyRewrittenQuery := contentdata.RewriteJobsHistoryQuery(r.queryRequest.Query, r.project.ID)
 	response, queryErr := r.server.contentRepo.Query(
 		ctx,
 		tx,
 		queryProjectID,
 		datasetID,
-		r.queryRequest.Query,
+		historyRewrittenQuery,
 		r.queryRequest.QueryParameters,
 	)
-	if queryErr != nil {
-		return nil, queryErr
-	}
 	endTime := time.Now()
 	// jobs.query allocates jobIDs server-side (real BigQuery does the
 	// same). queryRequest.RequestId is the *idempotency* key — same
@@ -2166,9 +2186,20 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 	// synthetic Job below carries the minimum fields the GET handler
 	// returns to the caller; DryRun queries skip both the AddJob and the
 	// Commit so they remain side-effect-free.
+	//
+	// The job is recorded even when the query failed: real BigQuery keeps
+	// the failed job (visible in INFORMATION_SCHEMA.JOBS with state DONE
+	// and an error_result), so the failure path commits the row before
+	// returning the error, keeping job history complete.
 	var totalBytes int64
 	if response != nil {
 		totalBytes = response.TotalBytes
+	}
+	status := &bigqueryv2.JobStatus{State: "DONE"}
+	if queryErr != nil {
+		internalErr := errJobInternalError(queryErr.Error())
+		status.ErrorResult = internalErr.ErrorProto()
+		status.Errors = []*bigqueryv2.ErrorProto{internalErr.ErrorProto()}
 	}
 	job := &bigqueryv2.Job{
 		Kind: "bigquery#job",
@@ -2187,7 +2218,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 				Priority:        "INTERACTIVE",
 			},
 		},
-		Status: &bigqueryv2.JobStatus{State: "DONE"},
+		Status: status,
 		Statistics: &bigqueryv2.JobStatistics{
 			Query: &bigqueryv2.JobStatistics2{
 				CacheHit:            false,
@@ -2217,7 +2248,7 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 				jobID,
 				job,
 				response,
-				nil,
+				queryErr,
 			),
 		); err != nil {
 			return nil, fmt.Errorf("failed to add job: %w", err)
@@ -2225,11 +2256,14 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 		if err := tx.Commit(); err != nil {
 			return nil, err
 		}
-		if response.ChangedCatalog.Changed() {
+		if response != nil && response.ChangedCatalog.Changed() {
 			if err := syncCatalog(ctx, r.server, response.ChangedCatalog); err != nil {
 				return nil, err
 			}
 		}
+	}
+	if queryErr != nil {
+		return nil, queryErr
 	}
 	response.Rows = internaltypes.Format(response.Schema, response.Rows, r.useInt64Timestamp)
 	response.JobReference = job.JobReference

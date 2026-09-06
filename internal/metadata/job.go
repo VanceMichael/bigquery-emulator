@@ -65,8 +65,33 @@ func (j *Job) Wait(ctx context.Context) (*internaltypes.QueryResponse, error) {
 	}
 }
 
-func (j *Job) Cancel(ctx context.Context) error {
-	// TODO: job needs to be able to rollback
+// Cancel records that the job was cancelled. The emulator runs jobs
+// synchronously, so a cancel request always arrives after the job has
+// reached a terminal state; we mirror BigQuery by stamping the job with
+// a DONE status carrying a "stopped" error result, and persist it in the
+// same transaction as the surrounding REST call. A job that already
+// failed keeps its original error result. The already-produced query
+// response is deliberately left intact so getQueryResults stays
+// compatible.
+func (j *Job) Cancel(ctx context.Context, tx *sql.Tx) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.content == nil {
+		j.content = &bigqueryv2.Job{}
+	}
+	if j.content.Status == nil {
+		j.content.Status = &bigqueryv2.JobStatus{}
+	}
+	if j.content.Status.ErrorResult == nil {
+		j.content.Status.State = "DONE"
+		j.content.Status.ErrorResult = &bigqueryv2.ErrorProto{
+			Reason:  "stopped",
+			Message: "Job execution was cancelled",
+		}
+	}
+	if err := j.repo.UpdateJob(ctx, tx, j); err != nil {
+		return fmt.Errorf("failed to update job: %w", err)
+	}
 	return nil
 }
 

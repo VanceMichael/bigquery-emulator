@@ -184,6 +184,10 @@ func (r *Repository) Query(ctx context.Context, tx *connection.Tx, projectID, da
 	if err := tx.ContentRepoMode(); err != nil {
 		return nil, err
 	}
+	// Route region-qualified INFORMATION_SCHEMA.JOBS references to the
+	// metadata-backed job history view before the query reaches the
+	// analyzer, which would otherwise report "Table not found".
+	query = rewriteJobsHistoryQuery(query, projectID)
 	defer func() {
 		_ = tx.MetadataRepoMode()
 	}()

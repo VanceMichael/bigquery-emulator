@@ -206,7 +206,7 @@ lives in the [`googlesqlite` status](https://github.com/goccy/googlesqlite#statu
 | Templated-argument functions | ✅ | |
 | Query parameters (named and positional) | ✅ | Empty / absent numeric, temporal and string parameters are treated as typed `NULL`s. |
 | Table-valued functions | ✅ | |
-| `INFORMATION_SCHEMA` views | 🟡 | `googlesqlite` implements `SCHEMATA`, `TABLES`, `TABLE_OPTIONS` and `COLUMNS`; other views (e.g. `JOBS`, `VIEWS`, `ROUTINES`, `PARTITIONS`) are not implemented. |
+| `INFORMATION_SCHEMA` views | 🟡 | `googlesqlite` implements `SCHEMATA`, `TABLES`, `TABLE_OPTIONS` and `COLUMNS`. The emulator additionally implements the region-scoped job history view `[project.]region-<location>.INFORMATION_SCHEMA.JOBS` (and `JOBS_BY_PROJECT` / `JOBS_BY_USER` / `JOBS_BY_ORGANIZATION` aliases), derived from the same persisted job metadata as `jobs.list` / `jobs.get`; other views (e.g. `VIEWS`, `ROUTINES`, `PARTITIONS`) are not implemented. |
 | Time travel (`FOR SYSTEM_TIME AS OF`) | ❌ | |
 | Sessions / multi-statement transactions over the REST API | ❌ | |
 | BigQuery ML statements (`CREATE MODEL`, `ML.*`) | ❌ | See [section 8](#8-bigquery-ml). |

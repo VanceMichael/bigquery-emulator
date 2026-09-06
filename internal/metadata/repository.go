@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   error     STRING,
   PRIMARY KEY (projectID, id)
 )`,
+	// The INFORMATION_SCHEMA.JOBS compatible view derives job history
+	// from the jobs table above, so it must be created after it.
+	jobsHistoryViewDDL,
 	`
 CREATE TABLE IF NOT EXISTS datasets (
   id         STRING NOT NULL,
