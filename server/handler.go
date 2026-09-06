@@ -3107,6 +3107,17 @@ func createTableMetadata(ctx context.Context, tx *connection.Tx, server *Server,
 	if table.MaterializedView != nil {
 		table.Type = string(MaterializedViewTableType)
 	}
+	// The dataset's defaultTableExpirationMs only applies to ordinary tables
+	// that do not set an explicit expirationTime: views (and materialized
+	// views) are excluded, and an explicit expirationTime always wins. The
+	// value is materialized onto the table at creation time, matching
+	// BigQuery, so later changes to the dataset default never affect
+	// existing tables.
+	if table.ExpirationTime == 0 && table.Type == string(DefaultTableType) {
+		if datasetContent := dataset.Content(); datasetContent != nil && datasetContent.DefaultTableExpirationMs > 0 {
+			table.ExpirationTime = time.Now().UnixMilli() + datasetContent.DefaultTableExpirationMs
+		}
+	}
 	table.Kind = "bigquery#table"
 	table.SelfLink = fmt.Sprintf(
 		"http://%s/bigquery/v2/projects/%s/datasets/%s/tables/%s",
@@ -3335,8 +3346,22 @@ func (h *tablesPatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	project := projectFromContext(ctx)
 	dataset := datasetFromContext(ctx)
 	table := tableFromContext(ctx)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		errorResponse(ctx, w, errInvalid(err.Error()))
+		return
+	}
 	var newTable bigqueryv2.Table
-	if err := json.NewDecoder(r.Body).Decode(&newTable); err != nil {
+	if err := json.Unmarshal(body, &newTable); err != nil {
+		errorResponse(ctx, w, errInvalid(err.Error()))
+		return
+	}
+	// Keep the raw patch map as well: decoding into the typed resource
+	// drops explicit JSON nulls (the field is omitempty), but PATCH uses
+	// null to clear a field, e.g. {"expirationTime": null} must remove a
+	// previously set expiration.
+	var rawPatch map[string]interface{}
+	if err := json.Unmarshal(body, &rawPatch); err != nil {
 		errorResponse(ctx, w, errInvalid(err.Error()))
 		return
 	}
@@ -3346,6 +3371,7 @@ func (h *tablesPatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		dataset:  dataset,
 		table:    table,
 		newTable: &newTable,
+		rawPatch: rawPatch,
 	})
 	if err != nil {
 		errorResponse(ctx, w, errInternalError(err.Error()))
@@ -3360,6 +3386,7 @@ type tablesPatchRequest struct {
 	dataset  *metadata.Dataset
 	table    *metadata.Table
 	newTable *bigqueryv2.Table
+	rawPatch map[string]interface{}
 }
 
 func (h *tablesPatchHandler) Handle(ctx context.Context, r *tablesPatchRequest) (*bigqueryv2.Table, error) {
@@ -3370,6 +3397,14 @@ func (h *tablesPatchHandler) Handle(ctx context.Context, r *tablesPatchRequest) 
 	var tableMetadata map[string]interface{}
 	if err := json.Unmarshal(encodedTableData, &tableMetadata); err != nil {
 		return nil, err
+	}
+	// An explicit `"expirationTime": null` in the patch clears the
+	// expiration. The typed round-trip above dropped the null (omitempty),
+	// so re-inject it as a nil patch value; Table.Patch interprets nil as
+	// "remove the field". A non-null expirationTime (override) is already
+	// carried by tableMetadata.
+	if rawValue, exists := r.rawPatch["expirationTime"]; exists && rawValue == nil {
+		tableMetadata["expirationTime"] = nil
 	}
 
 	conn, err := r.server.connMgr.Connection(ctx, r.project.ID, r.dataset.ID)

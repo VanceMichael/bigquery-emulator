@@ -29,8 +29,7 @@ func methodOverrideMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func sequentialAccessMiddleware() func(http.Handler) http.Handler {
-	var mu sync.Mutex
+func sequentialAccessMiddleware(mu *sync.Mutex) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()

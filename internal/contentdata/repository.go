@@ -687,6 +687,20 @@ type TableDeletion struct {
 }
 
 func (r *Repository) DeleteTables(ctx context.Context, tx *connection.Tx, projectID, datasetID string, tables []TableDeletion) error {
+	return r.deleteTables(ctx, tx, projectID, datasetID, tables, false)
+}
+
+// DeleteTablesIfExists drops the given tables or views using
+// `DROP ... IF EXISTS`, so an object whose content is already missing is a
+// no-op rather than an error. It is used by the expiration reaper: reclaiming
+// a table must be retryable, and a partially completed reclaim (content gone
+// but the metadata row still present) must be finishable instead of failing
+// forever on a missing content object.
+func (r *Repository) DeleteTablesIfExists(ctx context.Context, tx *connection.Tx, projectID, datasetID string, tables []TableDeletion) error {
+	return r.deleteTables(ctx, tx, projectID, datasetID, tables, true)
+}
+
+func (r *Repository) deleteTables(ctx context.Context, tx *connection.Tx, projectID, datasetID string, tables []TableDeletion, ifExists bool) error {
 	tx.SetProjectAndDataset(projectID, datasetID)
 	if err := tx.ContentRepoMode(); err != nil {
 		return err
@@ -704,6 +718,9 @@ func (r *Repository) DeleteTables(ctx context.Context, tx *connection.Tx, projec
 		stmt := "DROP TABLE"
 		if table.IsView {
 			stmt = "DROP VIEW"
+		}
+		if ifExists {
+			stmt += " IF EXISTS"
 		}
 		query := fmt.Sprintf("%s `%s`", stmt, tablePath)
 		if _, err := tx.Tx().ExecContext(ctx, query); err != nil {

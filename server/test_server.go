@@ -38,6 +38,9 @@ func (s *TestServer) GRPCClientOptions(ctx context.Context) ([]option.ClientOpti
 }
 
 func (s *Server) TestServer() *TestServer {
+	// Mirror Serve(): run the startup compensation pass and start the
+	// background expiration reaper before traffic is served.
+	s.startExpirationSweeper()
 	server := httptest.NewServer(s.Handler)
 	s.httpServer = server.Config
 

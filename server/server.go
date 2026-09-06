@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -33,6 +34,17 @@ type Server struct {
 	httpServer     *http.Server
 	grpcServer     *grpc.Server
 	listenCallback func(httpAddr, grpcAddr string)
+	// requestMu serializes REST traffic (see sequentialAccessMiddleware) and
+	// is also held by the table-expiration reaper so a reclaim never
+	// interleaves with an in-flight handler that cached table metadata.
+	requestMu *sync.Mutex
+	// sweeperInterval controls how often the background expiration reaper
+	// runs; zero means defaultExpirationSweepInterval.
+	sweeperInterval time.Duration
+	sweeperOnce     sync.Once
+	sweeperMu       sync.Mutex
+	sweeperStop     chan struct{}
+	sweeperDone     chan struct{}
 }
 
 // SetListenCallback registers a function invoked once the HTTP and gRPC
@@ -44,7 +56,7 @@ func (s *Server) SetListenCallback(callback func(httpAddr, grpcAddr string)) {
 }
 
 func New(storage Storage) (*Server, error) {
-	server := &Server{storage: storage}
+	server := &Server{storage: storage, requestMu: &sync.Mutex{}}
 	if storage == TempStorage {
 		f, err := os.CreateTemp("", "")
 		if err != nil {
@@ -92,7 +104,7 @@ func New(storage Storage) (*Server, error) {
 	r.Handle(uploadAPIEndpoint, &uploadHandler{}).Methods("POST")
 	r.Handle(uploadAPIEndpoint, &uploadContentHandler{}).Methods("PUT")
 	r.PathPrefix("/").Handler(&defaultHandler{})
-	r.Use(sequentialAccessMiddleware())
+	r.Use(sequentialAccessMiddleware(server.requestMu))
 	r.Use(recoveryMiddleware(server))
 	r.Use(loggerMiddleware(server))
 	r.Use(accessLogMiddleware())
@@ -118,6 +130,9 @@ func (s *Server) Close() error {
 			}
 		}
 	}()
+	// Stop the expiration reaper before closing the database so no sweep
+	// runs against a closed connection.
+	s.stopExpirationSweeper()
 	if err := s.db.Close(); err != nil {
 		log.Printf("failed to close database: %s", err.Error())
 		return err
@@ -221,6 +236,10 @@ func (s *Server) Load(sources ...Source) error {
 }
 
 func (s *Server) Serve(ctx context.Context, httpAddr, grpcAddr string) error {
+	// Run the startup compensation pass and start the background reaper
+	// before accepting traffic, so no expired table is ever served.
+	s.startExpirationSweeper()
+
 	httpServer := &http.Server{
 		Handler:      s.Handler,
 		Addr:         httpAddr,
